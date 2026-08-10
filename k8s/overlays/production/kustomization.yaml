@@ -78,6 +78,9 @@ images:
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/payment-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/payment-service
   newTag: d30780b
+- name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/pricing-service
+  newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/pricing-service
+  newTag: d30780b
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/product-catalog-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/product-catalog-service
   newTag: d30780b
