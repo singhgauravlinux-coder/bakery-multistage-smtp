@@ -50,6 +50,7 @@ commonLabels:
 
 
 
+
 patches:
 - path: patch-ingress-host.yaml
   target:
@@ -103,4 +104,7 @@ images:
   newTag: d30780b
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/recipe-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/recipe-service
+  newTag: d30780b
+- name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/search-service
+  newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/search-service
   newTag: d30780b
