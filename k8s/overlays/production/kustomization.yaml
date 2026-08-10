@@ -54,6 +54,9 @@ images:
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/language-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/language-service
   newTag: d30780b
+- name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/media-service
+  newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/media-service
+  newTag: d30780b
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/promotion-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/promotion-service
   newTag: d30780b
