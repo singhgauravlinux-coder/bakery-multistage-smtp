@@ -49,6 +49,7 @@ commonLabels:
 
 
 
+
 patches:
 - path: patch-ingress-host.yaml
   target:
@@ -88,6 +89,9 @@ patches:
     name: notification-worker
 
 images:
+- name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/inventory-service
+  newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/inventory-service
+  newTag: d30780b
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/language-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/language-service
   newTag: d30780b
