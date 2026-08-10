@@ -1,0 +1,78 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ---------------------------------------------------------------------------
+# UAT overlay - mirrors production shape (2 replicas) but on smaller
+# resource requests, so sign-off testing runs on real rolling-update
+# behaviour without paying full prod cost.
+# ---------------------------------------------------------------------------
+
+namespace: bakery-uat
+
+resources:
+- ../../base
+- ../../base/ingress
+
+commonLabels:
+  environment: uat
+  
+   
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+patches:
+- path: patch-ingress-host.yaml
+  target:
+    kind: Ingress
+    name: bakery-ingress
+- path: patch-ingress-middleware.yaml
+  target:
+    kind: Ingress
+    name: bakery-ingress
+- path: patch-db-ingress-host.yaml
+  target:
+    kind: Ingress
+    name: bakery-db-ingress
+- patch: |-
+    - op: replace
+      path: /spec/template/spec/containers/0/resources
+      value:
+        requests:
+          cpu: 50m
+          memory: 98Mi
+        limits:
+          cpu: 200m
+          memory: 220Mi
+
+    - op: replace
+      path: /spec/replicas
+      value: 1
+  target:
+    kind: Deployment
+    labelSelector: app.kubernetes.io/part-of=crumb-and-ember
+
+# The blanket replicas patch above also hits notification-worker. Delivery
+# throughput should scale independently of the API, and SKIP LOCKED claiming
+# makes extra replicas safe, so it is set explicitly here (this patch is
+# listed after the blanket one, so it wins).
+- patch: |-
+    - op: replace
+      path: /spec/replicas
+      value: 2
+  target:
+    kind: Deployment
+    name: notification-worker
+
+images: []

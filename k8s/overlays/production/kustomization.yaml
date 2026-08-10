@@ -1,0 +1,54 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# ---------------------------------------------------------------------------
+# PRODUCTION overlay - 2 replicas + real resource headroom on every service.
+# Deploys here are gated by a GitHub Environment approval (see
+# .github/workflows/_service-pipeline.yml) and only ever promote an image
+# that already passed dev and uat.
+# ---------------------------------------------------------------------------
+
+namespace: bakery-prod
+
+resources:
+- ../../base
+#- ../../base/ingress
+
+commonLabels:
+  environment: production
+
+#- path: patch-ingress-host.yaml
+#  target:
+#    kind: Ingress
+#    name: bakery-ingress
+patches:
+- patch: |-
+    - op: replace
+      path: /spec/template/spec/containers/0/resources
+      value:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 500m
+          memory: 384Mi
+    - op: replace
+      path: /spec/replicas
+      value: 1
+  target:
+    kind: Deployment
+    labelSelector: app.kubernetes.io/part-of=crumb-and-ember
+
+# The blanket replicas patch above also hits notification-worker. Delivery
+# throughput should scale independently of the API, and SKIP LOCKED claiming
+# makes extra replicas safe, so it is set explicitly here (this patch is
+# listed after the blanket one, so it wins).
+- patch: |-
+    - op: replace
+      path: /spec/replicas
+      value: 2
+  target:
+    kind: Deployment
+    name: notification-worker
+
+images: []
