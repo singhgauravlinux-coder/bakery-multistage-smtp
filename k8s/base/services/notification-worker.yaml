@@ -17,7 +17,7 @@ metadata:
 spec:
   # Workers claim jobs with FOR UPDATE SKIP LOCKED, so replicas can be raised
   # freely — two rows are never handed to two pods.
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: notification-worker
