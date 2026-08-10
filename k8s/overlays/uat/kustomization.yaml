@@ -39,6 +39,7 @@ commonLabels:
 # makes extra replicas safe, so it is set explicitly here (this patch is
 # listed after the blanket one, so it wins).
 
+
 patches:
 - path: patch-ingress-host.yaml
   target:
@@ -79,6 +80,9 @@ patches:
 images:
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/language-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/language-service
+  newTag: d30780b
+- name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/promotion-service
+  newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/promotion-service
   newTag: d30780b
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/recipe-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/recipe-service
