@@ -60,6 +60,9 @@ images:
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/currency-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/currency-service
   newTag: d30780b
+- name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/delivery-service
+  newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/delivery-service
+  newTag: d30780b
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/frontend
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/frontend
   newTag: d30780b
