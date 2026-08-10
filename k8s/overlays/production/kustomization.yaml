@@ -21,6 +21,11 @@ commonLabels:
 #  target:
 #    kind: Ingress
 #    name: bakery-ingress
+
+# The blanket replicas patch above also hits notification-worker. Delivery
+# throughput should scale independently of the API, and SKIP LOCKED claiming
+# makes extra replicas safe, so it is set explicitly here (this patch is
+# listed after the blanket one, so it wins).
 patches:
 - patch: |-
     - op: replace
@@ -38,11 +43,6 @@ patches:
   target:
     kind: Deployment
     labelSelector: app.kubernetes.io/part-of=crumb-and-ember
-
-# The blanket replicas patch above also hits notification-worker. Delivery
-# throughput should scale independently of the API, and SKIP LOCKED claiming
-# makes extra replicas safe, so it is set explicitly here (this patch is
-# listed after the blanket one, so it wins).
 - patch: |-
     - op: replace
       path: /spec/replicas
@@ -50,5 +50,7 @@ patches:
   target:
     kind: Deployment
     name: notification-worker
-
-images: []
+images:
+- name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/recipe-service
+  newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/recipe-service
+  newTag: d30780b
