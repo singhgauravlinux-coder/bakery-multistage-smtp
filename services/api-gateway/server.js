@@ -10,6 +10,15 @@ const SERVICE_NAME = process.env.SERVICE_NAME || 'api-gateway';
 const PORT = Number(process.env.PORT || 3000);
 const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 5000);
 
+// --- API docs hosting -------------------------------------------------------
+// Swagger UI used to be mounted straight onto the public gateway at
+// /api/docs, which meant anything that could reach the API could also read
+// the full API surface. It now lives on its own port/Service/Ingress.
+const DOCS_PORT = Number(process.env.DOCS_PORT || 3100);
+const DOCS_SERVER_ENABLED = (process.env.DOCS_SERVER_ENABLED || 'true') === 'true';
+// Escape hatch for local work: put the docs back on /api/docs.
+const DOCS_ON_GATEWAY = (process.env.API_DOCS_ON_GATEWAY || 'false') === 'true';
+
 // All logs are structured JSON on stdout (12-factor), ready for
 // Fluent Bit / Loki / ELK collection from the container runtime.
 const logger = pino({
@@ -109,9 +118,33 @@ app.use(pinoHttp({
 app.get('/health', (req, res) => res.json({ status: 'ok', service: SERVICE_NAME }));
 app.get('/ready', (req, res) => res.json({ ready: true, service: SERVICE_NAME }));
 
-// --- API docs --------------------------------------------------------------
-app.get('/api/openapi.json', (req, res) => res.json(openapiSpec));
-app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(openapiSpec));
+// --- API docs ---------------------------------------------------------------
+// The docs are no longer embedded in the public /api surface. They are served
+// by a SEPARATE listener (DOCS_PORT) fronted by its own Service + Ingress, so
+// access is controlled at the edge (own host, own middleware/basic-auth)
+// rather than by whoever happens to reach the gateway.
+//
+//   API_DOCS_ON_GATEWAY=true  -> legacy behaviour, /api/docs served inline
+//   API_DOCS_ON_GATEWAY=false -> /api/docs and /api/openapi.json return 404
+//                                on the main listener (default)
+//
+// The 404 is registered BEFORE the /api proxy so these paths can never be
+// forwarded upstream either.
+if (DOCS_ON_GATEWAY) {
+  logger.warn({ event: 'docs_exposed_on_gateway' },
+    'API docs are being served on the public /api listener — set API_DOCS_ON_GATEWAY=false and use the docs Ingress');
+  app.get('/api/openapi.json', (req, res) => res.json(openapiSpec));
+  app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(openapiSpec));
+} else {
+  app.use(['/api/docs', '/api/openapi.json'], (req, res) => {
+    req.log.info({ event: 'docs_blocked', requestUri: req.originalUrl },
+      'API docs are not served from this host');
+    res.status(404).json({
+      error: 'Not found',
+      hint: 'API documentation is published on its own host — ask your platform team for the docs URL.'
+    });
+  });
+}
 
 // --- Aggregated upstream health -------------------------------------------
 async function checkUpstream(baseUrl) {
@@ -220,12 +253,42 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error', traceId: req.traceId });
 });
 
+// --- Dedicated docs listener ------------------------------------------------
+// A second, independent Express app on DOCS_PORT. It is exposed by its own
+// Kubernetes Service (`api-docs`) and its own Ingress host, so the docs can
+// be published, firewalled or basic-auth'd without touching the API router.
+// It carries no proxy routes at all — the worst case if it leaks is that
+// someone reads the spec, not that they reach an upstream service.
+function createDocsApp() {
+  const docs = express();
+  docs.disable('x-powered-by');
+  docs.get('/health', (req, res) => res.json({ status: 'ok', service: `${SERVICE_NAME}-docs` }));
+  docs.get('/ready', (req, res) => res.json({ ready: true, service: `${SERVICE_NAME}-docs` }));
+  docs.get(['/openapi.json', '/api/openapi.json'], (req, res) => res.json(openapiSpec));
+  // Mounted at both paths so the Ingress can route either the whole host
+  // (docs.example.com/) or a /api/docs prefix, whichever you configure.
+  docs.use('/api/docs', swaggerUi.serve, swaggerUi.setup(openapiSpec));
+  docs.use('/docs', swaggerUi.serve, swaggerUi.setup(openapiSpec));
+  docs.get('/', (req, res) => res.redirect('/api/docs'));
+  docs.use((req, res) => res.status(404).json({ error: 'Not found' }));
+  return docs;
+}
+
 const server = app.listen(PORT, () =>
-  logger.info({ event: 'service_started', port: PORT, upstreams: UNIQUE_UPSTREAMS.length }, `${SERVICE_NAME} listening`));
+  logger.info({
+    event: 'service_started', port: PORT, upstreams: UNIQUE_UPSTREAMS.length,
+    docsOnGateway: DOCS_ON_GATEWAY, docsPort: DOCS_SERVER_ENABLED ? DOCS_PORT : null
+  }, `${SERVICE_NAME} listening`));
+
+const docsServer = DOCS_SERVER_ENABLED
+  ? createDocsApp().listen(DOCS_PORT, () =>
+    logger.info({ event: 'docs_server_started', port: DOCS_PORT }, 'API docs listening on its own port'))
+  : null;
 
 for (const signal of ['SIGTERM', 'SIGINT']) {
   process.on(signal, () => {
     logger.info({ event: 'shutdown', signal }, 'shutting down gracefully');
+    if (docsServer) docsServer.close();
     server.close(() => process.exit(0));
   });
 }

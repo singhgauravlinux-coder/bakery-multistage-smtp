@@ -1,6 +1,8 @@
 'use strict';
 // OpenAPI 3.0 specification for the Crumb & Ember platform.
-// Served by the gateway at /api/openapi.json and rendered at /api/docs.
+// Served by the dedicated docs listener (DOCS_PORT, Service `api-docs`) at
+// /openapi.json and rendered at /api/docs. NOT exposed on the public /api
+// gateway listener — see services/api-gateway/server.js.
 // All paths are the *public* gateway paths (/api/...); the gateway strips
 // the /api prefix before proxying to the owning service.
 
@@ -63,16 +65,82 @@ module.exports = {
     },
     '/auth/login': {
       post: {
-        tags: ['auth'], summary: 'Log in, returns a bearer token',
+        tags: ['auth'], summary: 'Log in — returns a short-lived access token plus a refresh token',
+        description: 'Response carries { token, refreshToken, expiresIn, idleTimeoutMs, absoluteTimeoutMs }. ' +
+          'The access token is deliberately short-lived; renew it with POST /auth/refresh.',
         requestBody: jsonBody({ email: str('jo@example.com'), password: str('s3cret!') }, ['email', 'password']),
-        responses: { 200: ok('Token issued'), 401: err('Invalid credentials') }
+        responses: { 200: ok('Session issued'), 401: err('Invalid credentials'), 423: err('Account locked') }
+      }
+    },
+    '/auth/refresh': {
+      post: {
+        tags: ['auth'],
+        summary: 'Exchange a refresh token for a fresh access token (rotates the refresh token)',
+        description: 'Single-use: a successful call invalidates the presented token. Replaying a consumed ' +
+          'token revokes the whole session (reuse detection). Also enforces the idle and absolute session ' +
+          'deadlines — the `reason` field on a 401 is one of session_idle_timeout, session_absolute_timeout, ' +
+          'refresh_token_expired, refresh_token_reuse, logout, logout_all, password_reset or password_changed.',
+        requestBody: jsonBody({ refreshToken: str('<sessionId>.<secret>') }, ['refreshToken']),
+        responses: { 200: ok('New access + refresh token'), 400: err('Malformed refresh token'), 401: err('Session ended or timed out') }
+      }
+    },
+    '/auth/session': {
+      get: {
+        tags: ['auth'],
+        summary: 'Current session status — remaining lifetime and email-verification state',
+        description: 'Cheap polling target so the UI can update itself instead of requiring a page reload.',
+        parameters: [hdr('authorization', 'Bearer <token>')],
+        responses: { 200: ok('{ active, expiresIn, idleExpiresAt, absoluteExpiresAt, emailVerified }'), 401: err('Invalid or expired token') }
       }
     },
     '/auth/verify': {
       get: {
         tags: ['auth'], summary: 'Verify a bearer token',
         parameters: [hdr('authorization', 'Bearer <token>')],
-        responses: { 200: ok('Token valid'), 401: err('Invalid or expired token') }
+        responses: { 200: ok('Token valid — includes expiresAt/expiresIn'), 401: err('Invalid or expired token') }
+      }
+    },
+    '/auth/logout': {
+      post: {
+        tags: ['auth'], summary: 'End this session (revokes its refresh token)',
+        parameters: [hdr('authorization', 'Bearer <token>')],
+        requestBody: jsonBody({ refreshToken: str('optional — used when the access token has already expired') }),
+        responses: { 200: ok('{ ok, revoked }'), 401: err('Invalid or expired token') }
+      }
+    },
+    '/auth/logout-all': {
+      post: {
+        tags: ['auth'], summary: 'End every session for the account, on all devices',
+        parameters: [hdr('authorization', 'Bearer <token>')],
+        responses: { 200: ok('{ ok, revoked }'), 401: err('Invalid or expired token') }
+      }
+    },
+    '/auth/verify-email/request': {
+      post: {
+        tags: ['auth'], summary: 'Email a verification link to the signed-in account',
+        parameters: [hdr('authorization', 'Bearer <token>')],
+        responses: { 200: ok('Link sent (or already verified)'), 401: err('Invalid or expired token') }
+      }
+    },
+    '/auth/verify-email/confirm': {
+      post: {
+        tags: ['auth'], summary: 'Redeem an email-verification token',
+        requestBody: jsonBody({ token: str('<verification token>') }, ['token']),
+        responses: { 200: ok('{ ok, emailVerified }'), 401: err('Link invalid or expired') }
+      },
+      get: {
+        tags: ['auth'], summary: 'Redeem an email-verification token from a raw link',
+        parameters: [{ name: 'token', in: 'query', required: true, schema: { type: 'string' } }],
+        responses: { 200: ok('{ ok, emailVerified }'), 401: err('Link invalid or expired') }
+      }
+    },
+    '/auth/verify-email/status': {
+      get: {
+        tags: ['auth'],
+        summary: 'Whether the signed-in account has verified its email',
+        description: 'Polled by the verification panel so clicking the link in a mail client updates the page on its own.',
+        parameters: [hdr('authorization', 'Bearer <token>')],
+        responses: { 200: ok('{ emailVerified, pollIntervalMs }'), 401: err('Invalid or expired token') }
       }
     },
     '/auth/forgot-password': {
