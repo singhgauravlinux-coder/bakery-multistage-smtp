@@ -8,3 +8,6 @@ kind: Kustomization
 # separately so they can still patch the host per environment.
 resources:
   - ingress.yaml
+  # API docs live on their own host/Service; see the file header for how to
+  # protect or remove them.
+  - api-docs-ingress.yaml
