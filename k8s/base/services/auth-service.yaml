@@ -50,6 +50,25 @@ spec:
                 secretKeyRef:
                   name: bakery-db-secret
                   key: AUTH_TOKEN_SECRET
+            # --- session policy ------------------------------------------
+            # Access tokens are short-lived and renewed silently by the
+            # browser with a rotating refresh token. A session ends on
+            # whichever comes first: inactivity (idle) or the hard ceiling
+            # measured from login (absolute).
+            - name: AUTH_ACCESS_TOKEN_TTL_MS
+              value: "900000"        # 15 minutes
+            - name: AUTH_REFRESH_TOKEN_TTL_MS
+              value: "604800000"     # 7 days
+            - name: AUTH_SESSION_IDLE_TIMEOUT_MS
+              value: "1800000"       # 30 minutes of inactivity
+            - name: AUTH_SESSION_ABSOLUTE_TTL_MS
+              value: "43200000"      # 12 hours from sign-in
+            # Public origin used to build the link inside verification
+            # emails. Must match the host users actually browse.
+            - name: APP_BASE_URL
+              value: "http://bakery.local"
+            - name: AUTH_VERIFY_POLL_INTERVAL_MS
+              value: "5000"
           readinessProbe:
             httpGet:
               path: /ready

@@ -27,7 +27,12 @@ spec:
           image: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/api-gateway:2e71aee
           imagePullPolicy: Always
           ports:
-            - containerPort: 3000
+            - name: http
+              containerPort: 3000
+            # Swagger UI runs on its own port so it can be exposed (or not)
+            # by a separate Service + Ingress instead of riding on /api.
+            - name: docs
+              containerPort: 3100
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -40,6 +45,14 @@ spec:
               value: "3000"
             - name: LOG_LEVEL
               value: "info"
+            # API docs are NOT served on the public /api listener. They are
+            # published by the `api-docs` Service via its own Ingress host.
+            - name: API_DOCS_ON_GATEWAY
+              value: "false"
+            - name: DOCS_SERVER_ENABLED
+              value: "true"
+            - name: DOCS_PORT
+              value: "3100"
           readinessProbe:
             httpGet:
               path: /ready
@@ -73,4 +86,25 @@ spec:
   ports:
     - port: 3000
       targetPort: 3000
+      protocol: TCP
+---
+# Separate Service for the docs listener. Splitting this out is what lets the
+# docs Ingress target the documentation without ever being able to route to
+# the API proxy, and lets you delete/disable the docs entirely by removing
+# this Service + its Ingress.
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-docs
+  namespace: bakery
+  labels:
+    app: api-gateway
+    component: docs
+spec:
+  selector:
+    app: api-gateway
+  ports:
+    - name: docs
+      port: 3100
+      targetPort: 3100
       protocol: TCP
