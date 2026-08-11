@@ -12,12 +12,35 @@ const SERVICE_NAME = process.env.SERVICE_NAME || 'auth-service';
 const PORT = Number(process.env.PORT || 3000);
 const DATABASE_URL = process.env.DATABASE_URL || '';
 const TOKEN_SECRET = process.env.AUTH_TOKEN_SECRET || 'dev-only-secret-change-me';
-const TOKEN_TTL_MS = Number(process.env.AUTH_TOKEN_TTL_MS || 24 * 60 * 60 * 1000);
+
+// --- Session lifetime knobs ---------------------------------------------
+// The access token is now deliberately SHORT lived; the browser silently
+// renews it with a long-lived, single-use refresh token (POST /auth/refresh).
+// Two independent timeouts bound how long a session can survive:
+//   * idle   — max gap between two refreshes before the session dies
+//   * absolute — hard ceiling from login, regardless of activity
+// All four are env-tunable so dev/uat/prod can pick their own policy.
+const ACCESS_TOKEN_TTL_MS = Number(
+  process.env.AUTH_ACCESS_TOKEN_TTL_MS || process.env.AUTH_TOKEN_TTL_MS || 15 * 60 * 1000);
+const REFRESH_TOKEN_TTL_MS = Number(process.env.AUTH_REFRESH_TOKEN_TTL_MS || 7 * 24 * 60 * 60 * 1000);
+const SESSION_IDLE_TIMEOUT_MS = Number(process.env.AUTH_SESSION_IDLE_TIMEOUT_MS || 30 * 60 * 1000);
+const SESSION_ABSOLUTE_TTL_MS = Number(process.env.AUTH_SESSION_ABSOLUTE_TTL_MS || 12 * 60 * 60 * 1000);
+// Kept as an alias so existing call sites / logs stay readable.
+const TOKEN_TTL_MS = ACCESS_TOKEN_TTL_MS;
+const SESSION_SWEEP_INTERVAL_MS = Number(process.env.AUTH_SESSION_SWEEP_INTERVAL_MS || 10 * 60 * 1000);
+
 const RESET_TOKEN_TTL_MS = Number(process.env.AUTH_RESET_TOKEN_TTL_MS || 15 * 60 * 1000);
 const CHANGE_TOKEN_TTL_MS = Number(process.env.AUTH_CHANGE_TOKEN_TTL_MS || 10 * 60 * 1000);
 const UNLOCK_TOKEN_TTL_MS = Number(process.env.AUTH_UNLOCK_TOKEN_TTL_MS || 30 * 60 * 1000);
 const MAX_FAILED_ATTEMPTS = Number(process.env.AUTH_MAX_FAILED_ATTEMPTS || 5);
 const NOTIFY_URL = process.env.NOTIFY_SERVICE_URL || 'http://notification-service:3010';
+// Public origin of the storefront, used to build the link inside the
+// verification email (e.g. https://dev.bakery.local). Relative by default so
+// the demo keeps working without extra configuration.
+const APP_BASE_URL = (process.env.APP_BASE_URL || '').replace(/\/+$/, '');
+// How often the browser should re-check verification status. Sent to the
+// client so the polling cadence is server-controlled, not hard-coded in HTML.
+const VERIFY_POLL_INTERVAL_MS = Number(process.env.AUTH_VERIFY_POLL_INTERVAL_MS || 5000);
 // The demo stack has no real mail transport (notification-service is a mock
 // dispatcher), so security tokens/OTPs are additionally returned in API
 // responses to keep the UI flows usable. MUST be "false" in production.
@@ -99,11 +122,48 @@ function verifyLegacyToken([payload, sig], purpose) {
   if ((data.purpose || 'session') !== purpose) return null;
   return data;
 }
-const signToken = (userId) => signScopedToken(userId, 'session', TOKEN_TTL_MS);
+// Access tokens now carry `sid` — the auth_sessions row they belong to —
+// so a refresh/logout can revoke everything issued under that login.
+const signToken = (userId, sessionId) =>
+  signScopedToken(userId, 'session', ACCESS_TOKEN_TTL_MS, sessionId ? { sid: sessionId } : undefined);
 const verifyToken = (token) => {
   const data = verifyScopedToken(token, 'session');
   return data ? data.sub : null;
 };
+const sessionClaims = (token) => verifyScopedToken(token, 'session');
+
+// --- Refresh tokens ------------------------------------------------------
+// Opaque, high-entropy and presented as `<sessionId>.<secret>`. Only the
+// SHA-256 of the secret is stored, so a database leak cannot be replayed.
+// The session id travels in the clear on purpose: when a rotated (already
+// consumed) token is presented we can still find the family and kill it.
+function mintRefreshToken(sessionId) {
+  const secret = crypto.randomBytes(32).toString('base64url');
+  return { token: `${sessionId}.${secret}`, hash: sha256(secret) };
+}
+function splitRefreshToken(refreshToken) {
+  const raw = String(refreshToken || '');
+  const dot = raw.indexOf('.');
+  if (dot < 1) return null;
+  return { sessionId: raw.slice(0, dot), hash: sha256(raw.slice(dot + 1)) };
+}
+// Everything the browser needs to run its own countdown without guessing.
+function sessionEnvelope(session, accessToken, refreshToken) {
+  const idleExpiresAt = new Date(new Date(session.lastUsedAt).getTime() + SESSION_IDLE_TIMEOUT_MS);
+  return {
+    token: accessToken,
+    tokenType: 'Bearer',
+    refreshToken,
+    sessionId: session.id,
+    expiresIn: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
+    expiresAt: new Date(Date.now() + ACCESS_TOKEN_TTL_MS).toISOString(),
+    refreshExpiresIn: Math.floor(REFRESH_TOKEN_TTL_MS / 1000),
+    idleTimeoutMs: SESSION_IDLE_TIMEOUT_MS,
+    absoluteTimeoutMs: SESSION_ABSOLUTE_TTL_MS,
+    idleExpiresAt: idleExpiresAt.toISOString(),
+    absoluteExpiresAt: new Date(session.absoluteExpiresAt).toISOString()
+  };
+}
 
 // --- Storage: PostgreSQL when DATABASE_URL is set, in-memory otherwise ---
 const pool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL, max: 10 }) : null;
@@ -164,6 +224,30 @@ const MIGRATION = `
   CREATE INDEX IF NOT EXISTS idx_audit_user    ON security_audit_logs (user_id, created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_audit_action  ON security_audit_logs (action, created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_audit_request ON security_audit_logs (request_id);
+
+  -- Refresh-token sessions. One row per login; the row is rotated in place
+  -- on every /auth/refresh (new secret hash, bumped last_used_at) so a
+  -- stolen-and-replayed refresh token is detectable. Mirrored by
+  -- db/migrations/0009_auth_sessions.sql for migration-tool users.
+  CREATE TABLE IF NOT EXISTS auth_sessions (
+    id                  TEXT PRIMARY KEY,
+    user_id             TEXT NOT NULL,
+    refresh_token_hash  TEXT NOT NULL,
+    issued_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at          TIMESTAMPTZ NOT NULL,
+    absolute_expires_at TIMESTAMPTZ NOT NULL,
+    rotations           INTEGER NOT NULL DEFAULT 0,
+    revoked_at          TIMESTAMPTZ,
+    revoked_reason      TEXT,
+    ip                  TEXT,
+    user_agent          TEXT,
+    browser             TEXT,
+    os                  TEXT,
+    device              TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_sessions_user ON auth_sessions (user_id, revoked_at);
+  CREATE INDEX IF NOT EXISTS idx_sessions_hash ON auth_sessions (refresh_token_hash);
 `;
 
 const ACCOUNT_ROW = `email, user_id AS "userId", name, password_hash AS "passwordHash",
@@ -171,8 +255,14 @@ const ACCOUNT_ROW = `email, user_id AS "userId", name, password_hash AS "passwor
   locked_at AS "lockedAt", unlock_token_expires_at AS "unlockTokenExpiresAt",
   email_verified AS "emailVerified"`;
 
+const SESSION_ROW = `id, user_id AS "userId", refresh_token_hash AS "refreshTokenHash",
+  issued_at AS "issuedAt", last_used_at AS "lastUsedAt", expires_at AS "expiresAt",
+  absolute_expires_at AS "absoluteExpiresAt", rotations,
+  revoked_at AS "revokedAt", revoked_reason AS "revokedReason"`;
+
 const memoryAccounts = new Map();
 const memoryLoginHistory = [];
+const memorySessions = new Map();
 
 function newMemoryAccount(email, name, passwordHash) {
   return {
@@ -247,6 +337,52 @@ const store = pool ? {
       [h.userId || null, h.email || null, h.success, h.failureReason || null,
        h.ip, h.userAgent, h.browser, h.os, h.device, h.requestId]);
   },
+  // ---- refresh-token sessions ----
+  async createSession(s) {
+    const { rows } = await pool.query(
+      `INSERT INTO auth_sessions
+         (id, user_id, refresh_token_hash, expires_at, absolute_expires_at, ip, user_agent, browser, os, device)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       RETURNING ${SESSION_ROW}`,
+      [s.id, s.userId, s.refreshTokenHash, s.expiresAt, s.absoluteExpiresAt,
+       s.ip || null, s.userAgent || null, s.browser || null, s.os || null, s.device || null]);
+    return rows[0];
+  },
+  async findSession(sessionId) {
+    const { rows } = await pool.query(
+      `SELECT ${SESSION_ROW} FROM auth_sessions WHERE id = $1`, [sessionId]);
+    return rows[0] || null;
+  },
+  // Atomic rotate: only swaps the secret if the presented hash is still the
+  // current one, so two parallel refreshes cannot both succeed.
+  async rotateSession(sessionId, oldHash, newHash, expiresAt) {
+    const { rows } = await pool.query(
+      `UPDATE auth_sessions
+          SET refresh_token_hash = $3, last_used_at = now(),
+              expires_at = $4, rotations = rotations + 1
+        WHERE id = $1 AND refresh_token_hash = $2 AND revoked_at IS NULL
+        RETURNING ${SESSION_ROW}`, [sessionId, oldHash, newHash, expiresAt]);
+    return rows[0] || null;
+  },
+  async revokeSession(sessionId, reason) {
+    const { rowCount } = await pool.query(
+      `UPDATE auth_sessions SET revoked_at = now(), revoked_reason = $2
+        WHERE id = $1 AND revoked_at IS NULL`, [sessionId, reason || 'logout']);
+    return rowCount > 0;
+  },
+  async revokeUserSessions(userId, reason) {
+    const { rowCount } = await pool.query(
+      `UPDATE auth_sessions SET revoked_at = now(), revoked_reason = $2
+        WHERE user_id = $1 AND revoked_at IS NULL`, [userId, reason || 'logout_all']);
+    return rowCount;
+  },
+  async purgeExpiredSessions() {
+    const { rowCount } = await pool.query(
+      `DELETE FROM auth_sessions
+        WHERE absolute_expires_at < now() - interval '1 day'
+           OR (revoked_at IS NOT NULL AND revoked_at < now() - interval '1 day')`);
+    return rowCount;
+  },
   async ping() { await pool.query('SELECT 1'); }
 } : {
   mode: 'memory',
@@ -310,6 +446,57 @@ const store = pool ? {
   async addLoginHistory(h) {
     memoryLoginHistory.push({ ...h, createdAt: new Date().toISOString() });
     if (memoryLoginHistory.length > 1000) memoryLoginHistory.shift();
+  },
+  // ---- refresh-token sessions ----
+  async createSession(s) {
+    const row = {
+      id: s.id, userId: s.userId, refreshTokenHash: s.refreshTokenHash,
+      issuedAt: new Date().toISOString(), lastUsedAt: new Date().toISOString(),
+      expiresAt: s.expiresAt, absoluteExpiresAt: s.absoluteExpiresAt,
+      rotations: 0, revokedAt: null, revokedReason: null,
+      ip: s.ip || null, userAgent: s.userAgent || null,
+      browser: s.browser || null, os: s.os || null, device: s.device || null
+    };
+    memorySessions.set(s.id, row);
+    return row;
+  },
+  async findSession(sessionId) { return memorySessions.get(sessionId) || null; },
+  async rotateSession(sessionId, oldHash, newHash, expiresAt) {
+    const row = memorySessions.get(sessionId);
+    if (!row || row.revokedAt || row.refreshTokenHash !== oldHash) return null;
+    row.refreshTokenHash = newHash;
+    row.lastUsedAt = new Date().toISOString();
+    row.expiresAt = expiresAt;
+    row.rotations += 1;
+    return row;
+  },
+  async revokeSession(sessionId, reason) {
+    const row = memorySessions.get(sessionId);
+    if (!row || row.revokedAt) return false;
+    row.revokedAt = new Date().toISOString();
+    row.revokedReason = reason || 'logout';
+    return true;
+  },
+  async revokeUserSessions(userId, reason) {
+    let n = 0;
+    for (const row of memorySessions.values()) {
+      if (row.userId === userId && !row.revokedAt) {
+        row.revokedAt = new Date().toISOString();
+        row.revokedReason = reason || 'logout_all';
+        n += 1;
+      }
+    }
+    return n;
+  },
+  async purgeExpiredSessions() {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    let n = 0;
+    for (const [id, row] of memorySessions) {
+      const dead = new Date(row.absoluteExpiresAt).getTime() < cutoff ||
+        (row.revokedAt && new Date(row.revokedAt).getTime() < cutoff);
+      if (dead) { memorySessions.delete(id); n += 1; }
+    }
+    return n;
   },
   async ping() {}
 };
@@ -546,6 +733,23 @@ async function handleFailedLogin(req, res, info, email, account, reason) {
   return res.status(401).json(payload);
 }
 
+// Create the auth_sessions row backing a login and mint its first refresh
+// token. Both timeout deadlines are stamped here, at login time.
+async function startSession(userId, info) {
+  const id = crypto.randomUUID();
+  const refresh = mintRefreshToken(id);
+  const now = Date.now();
+  const session = await store.createSession({
+    id,
+    userId,
+    refreshTokenHash: refresh.hash,
+    expiresAt: new Date(now + REFRESH_TOKEN_TTL_MS).toISOString(),
+    absoluteExpiresAt: new Date(now + SESSION_ABSOLUTE_TTL_MS).toISOString(),
+    ip: info.ip, userAgent: info.userAgent, browser: info.browser, os: info.os, device: info.device
+  });
+  return { session, refreshToken: refresh.token };
+}
+
 // --- Login, registration and token verification ---
 app.post('/auth/login', async (req, res, next) => {
   try {
@@ -569,12 +773,137 @@ app.post('/auth/login', async (req, res, next) => {
 
     await store.resetLoginFailures(account.userId);
     await store.addLoginHistory({ ...info, userId: account.userId, email, success: true });
+
+    const { session, refreshToken } = await startSession(account.userId, info);
+    const accessToken = signToken(account.userId, session.id);
+
     req.log.info({
       event: 'login_success', userId: account.userId, email, ip: info.ip,
-      requestId: info.requestId, browser: info.browser, os: info.os, device: info.device
+      requestId: info.requestId, browser: info.browser, os: info.os, device: info.device,
+      sessionId: session.id, accessTokenTtlMs: ACCESS_TOKEN_TTL_MS,
+      idleTimeoutMs: SESSION_IDLE_TIMEOUT_MS, absoluteTimeoutMs: SESSION_ABSOLUTE_TTL_MS
     }, 'user logged in');
-    audit.record({ ...info, action: 'login', userId: account.userId, email, success: true, statusCode: 200 });
-    res.json({ token: signToken(account.userId), userId: account.userId, name: account.name });
+    audit.record({
+      ...info, action: 'login', userId: account.userId, email, success: true, statusCode: 200,
+      metadata: { sessionId: session.id }
+    });
+    res.json({
+      ...sessionEnvelope(session, accessToken, refreshToken),
+      userId: account.userId,
+      name: account.name,
+      emailVerified: Boolean(account.emailVerified)
+    });
+  } catch (err) { next(err); }
+});
+
+// --- Refresh: swap a valid refresh token for a fresh access token --------
+// Enforces BOTH timeouts on every call:
+//   * idle     — too long since the last refresh -> session revoked
+//   * absolute — too long since login            -> session revoked
+// The refresh token itself is single-use: a successful call rotates it and
+// the old value is dead. Presenting an already-rotated token is treated as
+// theft and kills the whole session (OAuth 2.0 BCP reuse detection).
+app.post('/auth/refresh', async (req, res, next) => {
+  try {
+    const info = clientInfo(req);
+    const presented = (req.body && req.body.refreshToken) || '';
+    const parts = splitRefreshToken(presented);
+    if (!parts) {
+      audit.record({ ...info, action: 'token_refresh', success: false, statusCode: 400, failureReason: 'malformed_refresh_token' });
+      return res.status(400).json({ error: 'refreshToken is required', reason: 'malformed_refresh_token' });
+    }
+
+    const existing = await store.findSession(parts.sessionId);
+    if (!existing) {
+      audit.record({ ...info, action: 'token_refresh', success: false, statusCode: 401, failureReason: 'unknown_session' });
+      return res.status(401).json({ error: 'Session not found — please sign in again', reason: 'unknown_session' });
+    }
+    if (existing.revokedAt) {
+      audit.record({
+        ...info, action: 'token_refresh', userId: existing.userId, success: false, statusCode: 401,
+        failureReason: existing.revokedReason || 'session_revoked', metadata: { sessionId: existing.id }
+      });
+      return res.status(401).json({ error: 'Session has ended — please sign in again', reason: existing.revokedReason || 'session_revoked' });
+    }
+
+    const now = Date.now();
+    const idleDeadline = new Date(existing.lastUsedAt).getTime() + SESSION_IDLE_TIMEOUT_MS;
+    const expired =
+      now > new Date(existing.expiresAt).getTime() ? 'refresh_token_expired' :
+      now > new Date(existing.absoluteExpiresAt).getTime() ? 'session_absolute_timeout' :
+      now > idleDeadline ? 'session_idle_timeout' : null;
+    if (expired) {
+      await store.revokeSession(existing.id, expired);
+      req.log.info({ event: 'session_expired', userId: existing.userId, sessionId: existing.id, reason: expired }, 'session timed out');
+      audit.record({
+        ...info, action: 'session_timeout', userId: existing.userId, success: false, statusCode: 401,
+        failureReason: expired, metadata: { sessionId: existing.id }
+      });
+      return res.status(401).json({ error: 'Your session has timed out — please sign in again', reason: expired });
+    }
+
+    const next$ = mintRefreshToken(existing.id);
+    const rotated = await store.rotateSession(
+      existing.id, parts.hash, next$.hash, new Date(now + REFRESH_TOKEN_TTL_MS).toISOString());
+
+    if (!rotated) {
+      // The session is live but the presented secret is stale => replay.
+      await store.revokeSession(existing.id, 'refresh_token_reuse');
+      req.log.warn({
+        event: 'refresh_token_reuse', userId: existing.userId, sessionId: existing.id,
+        ip: info.ip, requestId: info.requestId
+      }, 'rotated refresh token replayed — session revoked');
+      audit.record({
+        ...info, action: 'refresh_token_reuse', userId: existing.userId, success: false, statusCode: 401,
+        failureReason: 'refresh_token_reuse', metadata: { sessionId: existing.id }
+      });
+      return res.status(401).json({ error: 'Session ended for your security — please sign in again', reason: 'refresh_token_reuse' });
+    }
+
+    const account = await store.findById(rotated.userId);
+    const accessToken = signToken(rotated.userId, rotated.id);
+    audit.record({
+      ...info, action: 'token_refresh', userId: rotated.userId, success: true, statusCode: 200,
+      metadata: { sessionId: rotated.id, rotations: rotated.rotations }
+    });
+    res.json({
+      ...sessionEnvelope(rotated, accessToken, next$.token),
+      userId: rotated.userId,
+      name: account ? account.name : undefined,
+      emailVerified: Boolean(account && account.emailVerified)
+    });
+  } catch (err) { next(err); }
+});
+
+// --- Session status ------------------------------------------------------
+// Cheap polling target for the browser: how long is left, and has the
+// email been verified since the page was loaded? Lets the UI update itself
+// instead of the user hitting reload.
+app.get('/auth/session', async (req, res, next) => {
+  try {
+    const claims = sessionClaims(bearerToken(req));
+    if (!claims) return res.status(401).json({ active: false, reason: 'invalid_or_expired_token' });
+    const account = await store.findById(claims.sub);
+    if (!account) return res.status(404).json({ active: false, reason: 'account_not_found' });
+
+    const session = claims.sid ? await store.findSession(claims.sid) : null;
+    if (session && session.revokedAt) {
+      return res.status(401).json({ active: false, reason: session.revokedReason || 'session_revoked' });
+    }
+    res.json({
+      active: true,
+      userId: claims.sub,
+      name: account.name,
+      email: account.email,
+      emailVerified: Boolean(account.emailVerified),
+      sessionId: claims.sid || null,
+      expiresAt: new Date(claims.exp * 1000).toISOString(),
+      expiresIn: Math.max(claims.exp - Math.floor(Date.now() / 1000), 0),
+      idleTimeoutMs: SESSION_IDLE_TIMEOUT_MS,
+      absoluteTimeoutMs: SESSION_ABSOLUTE_TTL_MS,
+      idleExpiresAt: session ? new Date(new Date(session.lastUsedAt).getTime() + SESSION_IDLE_TIMEOUT_MS).toISOString() : null,
+      absoluteExpiresAt: session ? new Date(session.absoluteExpiresAt).toISOString() : null
+    });
   } catch (err) { next(err); }
 });
 
@@ -612,26 +941,57 @@ app.post('/auth/register', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// Stateless tokens can't be revoked server-side; logout exists so the
-// sign-out event is captured in the audit trail with full client context.
+// Logout now genuinely ends the session: the refresh token is revoked so it
+// can never be exchanged again. The already-issued access token stays valid
+// for its (short) remaining lifetime — that is the accepted trade-off of
+// stateless JWTs, and why ACCESS_TOKEN_TTL_MS is minutes rather than a day.
+// The session id is taken from the access token's `sid`, or from an
+// explicitly supplied refreshToken when the access token has already gone.
 app.post('/auth/logout', async (req, res, next) => {
   try {
     const info = clientInfo(req);
-    const userId = verifyToken(bearerToken(req));
-    if (!userId) {
+    const claims = sessionClaims(bearerToken(req));
+    const supplied = splitRefreshToken((req.body && req.body.refreshToken) || '');
+    const sessionId = (claims && claims.sid) || (supplied && supplied.sessionId) || null;
+
+    if (!claims && !supplied) {
       audit.record({ ...info, action: 'logout', success: false, statusCode: 401, failureReason: 'invalid_token' });
       return res.status(401).json({ error: 'Invalid or expired token' });
     }
-    req.log.info({ event: 'logout', userId, ip: info.ip, requestId: info.requestId }, 'user logged out');
-    audit.record({ ...info, action: 'logout', userId, success: true, statusCode: 200 });
-    res.json({ ok: true });
+
+    let revoked = false;
+    if (sessionId) revoked = await store.revokeSession(sessionId, 'logout');
+
+    const userId = claims ? claims.sub : null;
+    req.log.info({ event: 'logout', userId, sessionId, revoked, ip: info.ip, requestId: info.requestId }, 'user logged out');
+    audit.record({ ...info, action: 'logout', userId, success: true, statusCode: 200, metadata: { sessionId, revoked } });
+    res.json({ ok: true, revoked });
+  } catch (err) { next(err); }
+});
+
+// Sign out everywhere — revokes every live session for the account.
+app.post('/auth/logout-all', async (req, res, next) => {
+  try {
+    const info = clientInfo(req);
+    const userId = verifyToken(bearerToken(req));
+    if (!userId) return res.status(401).json({ error: 'Invalid or expired token' });
+    const revoked = await store.revokeUserSessions(userId, 'logout_all');
+    req.log.info({ event: 'logout_all', userId, revoked, requestId: info.requestId }, 'all sessions revoked');
+    audit.record({ ...info, action: 'logout_all', userId, success: true, statusCode: 200, metadata: { revoked } });
+    res.json({ ok: true, revoked });
   } catch (err) { next(err); }
 });
 
 app.get('/auth/verify', (req, res) => {
-  const userId = verifyToken(bearerToken(req));
-  if (!userId) return res.status(401).json({ valid: false });
-  res.json({ valid: true, userId });
+  const claims = sessionClaims(bearerToken(req));
+  if (!claims) return res.status(401).json({ valid: false });
+  res.json({
+    valid: true,
+    userId: claims.sub,
+    sessionId: claims.sid || null,
+    expiresAt: new Date(claims.exp * 1000).toISOString(),
+    expiresIn: Math.max(claims.exp - Math.floor(Date.now() / 1000), 0)
+  });
 });
 
 // Step 1 of the forgot-password flow: issue a short-lived, purpose-scoped
@@ -677,8 +1037,11 @@ app.post('/auth/reset-password', async (req, res, next) => {
 
     const updated = await store.updatePassword(claims.sub, hashPassword(newPassword));
     if (!updated) return res.status(404).json({ error: 'Account not found' });
-    // A successful password reset also clears any lockout.
+    // A successful password reset also clears any lockout...
     await store.resetLoginFailures(claims.sub);
+    // ...and invalidates every existing session, so a refresh token stolen
+    // before the reset cannot outlive it.
+    await store.revokeUserSessions(claims.sub, 'password_reset');
 
     req.log.info({ event: 'password_reset', userId: claims.sub, ip: info.ip, requestId: info.requestId }, 'password reset via forgot-password flow');
     audit.record({ ...info, action: 'reset_password', userId: claims.sub, success: true, statusCode: 200 });
@@ -747,6 +1110,9 @@ app.post('/auth/password', async (req, res, next) => {
     }
 
     await store.updatePassword(userId, hashPassword(newPassword));
+    // Changing the password ends every session, including this one — the
+    // browser is expected to sign in again with the new credentials.
+    await store.revokeUserSessions(userId, 'password_changed');
     req.log.info({ event: 'password_updated', userId, ip: info.ip, requestId: info.requestId }, 'password updated after OTP verification');
     audit.record({ ...info, action: 'change_password', userId, email: account.email, success: true, statusCode: 200 });
     res.json({ ok: true });
@@ -754,6 +1120,25 @@ app.post('/auth/password', async (req, res, next) => {
 });
 
 // --- Email verification --------------------------------------------------
+// Polling target for the verification screen. The browser hits this every
+// few seconds while the banner is showing, so clicking the link in a mail
+// client (or another tab) updates the page by itself — no manual reload.
+app.get('/auth/verify-email/status', async (req, res, next) => {
+  try {
+    const userId = verifyToken(bearerToken(req));
+    if (!userId) return res.status(401).json({ error: 'Invalid or expired token' });
+    const account = await store.findById(userId);
+    if (!account) return res.status(404).json({ error: 'Account not found' });
+    res.json({
+      userId,
+      email: account.email,
+      emailVerified: Boolean(account.emailVerified),
+      pollIntervalMs: VERIFY_POLL_INTERVAL_MS,
+      checkedAt: new Date().toISOString()
+    });
+  } catch (err) { next(err); }
+});
+
 app.post('/auth/verify-email/request', async (req, res, next) => {
   try {
     const info = clientInfo(req);
@@ -764,19 +1149,32 @@ app.post('/auth/verify-email/request', async (req, res, next) => {
     if (account.emailVerified) return res.json({ ok: true, message: 'Email already verified.' });
 
     const verifyEmailToken = signScopedToken(userId, 'verify-email', RESET_TOKEN_TTL_MS);
+    // Deep link back into the SPA: the page reads ?verify=<token> on load,
+    // confirms it and updates the badge in place.
+    const verifyLink = `${APP_BASE_URL}/?verify=${encodeURIComponent(verifyEmailToken)}`;
     await sendEmail(account.email, 'Verify your Crumb & Ember email',
-      'Use this link within 15 minutes to verify your email address.', req.log, req.traceId);
+      `Use this link within ${Math.round(RESET_TOKEN_TTL_MS / 60000)} minutes to verify your email address: ${verifyLink}`,
+      req.log, req.traceId);
     audit.record({ ...info, action: 'email_verification_request', userId, email: account.email, success: true, statusCode: 200 });
-    const payload = { message: 'A verification link was emailed to you.' };
-    if (RETURN_DEBUG_TOKENS) payload.verifyToken = verifyEmailToken;
+    const payload = {
+      message: 'A verification link was emailed to you.',
+      pollIntervalMs: VERIFY_POLL_INTERVAL_MS,
+      expiresInMs: RESET_TOKEN_TTL_MS
+    };
+    if (RETURN_DEBUG_TOKENS) {
+      payload.verifyToken = verifyEmailToken;
+      payload.verifyLink = verifyLink;
+    }
     res.json(payload);
   } catch (err) { next(err); }
 });
 
-app.post('/auth/verify-email/confirm', async (req, res, next) => {
+// Accepts the token in the body (SPA) or the query string (someone pasting
+// the raw link straight at the API), so both entry points work.
+async function confirmEmailVerification(req, res, next) {
   try {
     const info = clientInfo(req);
-    const { token } = req.body || {};
+    const token = (req.body && req.body.token) || req.query.token;
     if (!token) return res.status(400).json({ error: 'token is required' });
     const claims = verifyScopedToken(token, 'verify-email');
     if (!claims) {
@@ -786,9 +1184,11 @@ app.post('/auth/verify-email/confirm', async (req, res, next) => {
     const updated = await store.setEmailVerified(claims.sub);
     if (!updated) return res.status(404).json({ error: 'Account not found' });
     audit.record({ ...info, action: 'email_verification', userId: claims.sub, success: true, statusCode: 200 });
-    res.json({ ok: true });
+    res.json({ ok: true, emailVerified: true, userId: claims.sub });
   } catch (err) { next(err); }
-});
+}
+app.post('/auth/verify-email/confirm', confirmEmailVerification);
+app.get('/auth/verify-email/confirm', confirmEmailVerification);
 
 // --- 404 + error handling ----------------------------------------------
 app.use((req, res) => res.status(404).json({ error: 'Route not found' }));
@@ -811,10 +1211,30 @@ async function runMigrationWithRetry(attempt = 1) {
   }
 }
 
+// Housekeeping: drop long-dead session rows so auth_sessions stays small.
+// Deliberately lazy (interval, unref'd) — correctness never depends on it,
+// because every read path re-checks revoked_at and both deadlines.
+function startSessionSweeper() {
+  const timer = setInterval(() => {
+    store.purgeExpiredSessions()
+      .then((n) => { if (n) logger.info({ event: 'sessions_purged', purged: n }, 'expired sessions cleaned up'); })
+      .catch((err) => logger.warn({ event: 'session_purge_failed', message: err.message }, 'session sweep failed'));
+  }, SESSION_SWEEP_INTERVAL_MS);
+  timer.unref();
+  return timer;
+}
+
 function start() {
   const server = app.listen(PORT, () => {
-    logger.info({ event: 'service_started', port: PORT, storage: store.mode }, `${SERVICE_NAME} listening`);
+    logger.info({
+      event: 'service_started', port: PORT, storage: store.mode,
+      accessTokenTtlMs: ACCESS_TOKEN_TTL_MS,
+      refreshTokenTtlMs: REFRESH_TOKEN_TTL_MS,
+      sessionIdleTimeoutMs: SESSION_IDLE_TIMEOUT_MS,
+      sessionAbsoluteTtlMs: SESSION_ABSOLUTE_TTL_MS
+    }, `${SERVICE_NAME} listening`);
     runMigrationWithRetry();
+    startSessionSweeper();
   });
   for (const signal of ['SIGTERM', 'SIGINT']) {
     process.on(signal, () => {
@@ -827,4 +1247,10 @@ function start() {
 
 if (require.main === module) start();
 
-module.exports = { app, store, audit, securePayload, signScopedToken, verifyScopedToken, hashPassword, verifyPassword, MAX_FAILED_ATTEMPTS };
+module.exports = {
+  app, store, audit, securePayload,
+  signScopedToken, verifyScopedToken, hashPassword, verifyPassword,
+  MAX_FAILED_ATTEMPTS,
+  ACCESS_TOKEN_TTL_MS, REFRESH_TOKEN_TTL_MS,
+  SESSION_IDLE_TIMEOUT_MS, SESSION_ABSOLUTE_TTL_MS
+};
