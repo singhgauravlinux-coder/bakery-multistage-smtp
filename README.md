@@ -301,3 +301,73 @@ Run everything with `make up`, then open http://localhost:8080 (demo login: `ame
 > This implementation is provided **for testing purposes only**.
 >
 > 🔐 In **production**, store all secrets in **Azure Key Vault** (or another secure secrets manager) and **never hardcode credentials** in source code, configuration files, or repositories.
+
+# Banner / email templates only
+
+## Use it
+
+```bash
+curl -X POST localhost:3010/notify/email -H 'content-type: application/json' -d '{
+  "to": "customer@example.com",
+  "template": "verification-code",
+  "data": { "code": "561924", "purpose": "password change", "expiresMinutes": 10, "customerName": "Gaurav" }
+}'
+```
+
+```bash
+curl -X POST localhost:3010/notify/email -H 'content-type: application/json' -d '{
+  "to": "customer@example.com",
+  "template": "order-confirmation",
+  "data": {
+    "orderId": "CE-1042", "customerName": "Gaurav", "currency": "₹",
+    "items": [{ "name": "Sourdough, seeded", "qty": 2, "price": 320 }],
+    "subtotal": 320, "delivery": 60, "total": 380,
+    "readyAt": "today from 4pm", "fulfilment": "delivery",
+    "address": "14 Brigade Road, Bengaluru 560001",
+    "orderUrl": "https://crumb-and-ember.example/orders/CE-1042"
+  }
+}'
+```
+
+`item.price` is the **line total**; the unit price appears underneath
+automatically when `qty > 1`. A `subject` in the request overrides the
+template's own. Rendering happens in the worker at delivery time, so fixing a
+typo also fixes jobs already queued.
+
+Preview without sending:
+
+```
+GET /notify/templates
+GET /notify/templates/:name/preview
+GET /notify/templates/:name/preview?format=text
+```
+
+`preview/` holds the rendered HTML and screenshots — open the `.html` files in
+a browser to iterate on copy without running anything.
+
+## Why it looks the way it does
+
+- **No images.** The banner is type and colour blocks. Gmail blocks remote
+  images by default for unknown senders, so an image banner would be a grey
+  box on the first email a new customer ever gets.
+- **Tables and inline styles only.** Gmail strips `<style>` in several
+  contexts; Outlook never had modern layout.
+- **Colours are your own site tokens** from `services/frontend/index.html`
+  (strawberry `#FF4D8D`, butter `#FFB428`, chocolate `#33200F`, pistachio
+  `#2FBF71`). The accent stripe is the one thing that changes per message type.
+- **Dark mode:** saturated pink and chocolate rather than white, because
+  Gmail's dark theme rewrites near-white backgrounds and leaves saturated ones
+  alone. Worth confirming on your own phone — Gmail's inversion is client-side
+  and can't be simulated.
+- **Always a text/plain part.** HTML-only mail is a spam signal and unreadable
+  in watch previews.
+- **All interpolated values are HTML-escaped** — customer and item names are
+  user input.
+
+## Adding a template
+
+Add a function to `TEMPLATES` in `templates.js` returning
+`{ subject, html, text }`. Reuse `shell()`, `banner(accent, eyebrow)` and
+`footer()` so it inherits the chrome; pick the accent from the palette at the
+top. No other file changes.
+
