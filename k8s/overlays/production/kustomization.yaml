@@ -101,7 +101,7 @@ images:
   newTag: d30780b
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/notification-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/notification-service
-  newTag: 4f9679b
+  newTag: d9511f9
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/order-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/order-service
   newTag: d30780b
