@@ -7,6 +7,7 @@
 // docker-compose.yml); against Gmail it is smtp.gmail.com with an App
 // Password. SMS stays mocked; swap sendSms for a Twilio client the same way.
 const nodemailer = require('nodemailer');
+const { render } = require('./templates');
 
 const SMTP_HOST = process.env.SMTP_HOST || '';
 const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
@@ -78,12 +79,18 @@ function isInfrastructure(err) {
 }
 
 async function sendViaSmtp(job) {
+  // Rendered here rather than at enqueue time, so a template fix reaches jobs
+  // that are already sitting in the queue.
+  const rendered = job.template ? render(job.template, job.payload || {}, { subject: job.subject }) : null;
   try {
     const info = await transport.sendMail({
       from: SMTP_FROM,
       to: job.recipient,
-      subject: job.subject || '(no subject)',
-      text: job.body || '',
+      subject: (rendered ? rendered.subject : job.subject) || '(no subject)',
+      // Both parts, always: text/plain keeps the message readable in previews
+      // and out of spam filters that distrust HTML-only mail.
+      text: rendered ? rendered.text : (job.body || ''),
+      ...(rendered ? { html: rendered.html } : {}),
       // Lets a delivery in the mail server's logs be traced back to the API
       // request that queued it, same as the JSON logs.
       headers: { 'X-Trace-Id': job.traceId || '', 'X-Notification-Job-Id': job.id }
