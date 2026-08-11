@@ -2,21 +2,26 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 # ---------------------------------------------------------------------------
-# UAT overlay - mirrors production shape (2 replicas) but on smaller
-# resource requests, so sign-off testing runs on real rolling-update
-# behaviour without paying full prod cost.
+# DEV overlay
+#   - one namespace per env, everything else inherited from ../../base
+#   - 1 replica per service (cheap, fast feedback)
+#   - images are pinned per-service by the service's own CI pipeline via
+#     `kustomize edit set image` (see .github/workflows/_service-pipeline.yml)
 # ---------------------------------------------------------------------------
 
-namespace: bakery-uat
+  # Every service Deployment has exactly one container, so a positional
+  # JSON6902 patch (index 0) works regardless of container name and applies
+  # identically to all 25 services in one shot.
+namespace: bakery-dev
 
 resources:
 - ../../base
 - ../../base/ingress
 
 commonLabels:
-  environment: uat
-  
-   
+  environment: dev
+
+    
 
 
 
@@ -33,13 +38,14 @@ commonLabels:
 
 
 
-
+# Image tags are rewritten in-place by each service's pipeline, e.g.:
+#   images:
+#     - name: ghcr.io/OWNER/bakery-language/auth-service
+#       newTag: <short-sha>
 # The blanket replicas patch above also hits notification-worker. Delivery
 # throughput should scale independently of the API, and SKIP LOCKED claiming
 # makes extra replicas safe, so it is set explicitly here (this patch is
 # listed after the blanket one, so it wins).
-
-
 
 
 
@@ -80,16 +86,20 @@ patches:
   target:
     kind: Ingress
     name: bakery-db-ingress
+- path: patch-docs-ingress-host.yaml
+  target:
+    kind: Ingress
+    name: bakery-docs-ingress
 - patch: |-
     - op: replace
       path: /spec/template/spec/containers/0/resources
       value:
         requests:
-          cpu: 50m
-          memory: 98Mi
+          cpu: 25m
+          memory: 64Mi
         limits:
-          cpu: 200m
-          memory: 220Mi
+          cpu: 150m
+          memory: 192Mi
 
     - op: replace
       path: /spec/replicas
@@ -100,20 +110,40 @@ patches:
 - patch: |-
     - op: replace
       path: /spec/replicas
-      value: 2
+      value: 1
   target:
     kind: Deployment
     name: notification-worker
+
+# The verification email links back into the SPA, so the base URL has to be
+# this environment's public host or the link lands on the wrong stack.
+- patch: |-
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: auth-service
+    spec:
+      template:
+        spec:
+          containers:
+            - name: auth-service
+              env:
+                - name: APP_BASE_URL
+                  value: "http://dev.bakery.local"
+  target:
+    kind: Deployment
+    name: auth-service
+
 images:
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/analytics-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/analytics-service
   newTag: d30780b
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/api-gateway
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/api-gateway
-  newTag: 37677b7
+  newTag: d30780b
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/auth-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/auth-service
-  newTag: 37677b7
+  newTag: f2b5fa5
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/baking-schedule-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/baking-schedule-service
   newTag: d30780b
