@@ -317,18 +317,21 @@ const store = pool ? {
 const audit = createAuditLogger({ pool, logger, service: SERVICE_NAME });
 
 // --- Outbound e-mail via notification-service (mock dispatcher) ---------
-async function sendEmail(to, subject, body, log, traceId) {
+// `template` + `data` select an HTML template in notification-service
+// (lib/templates.js); `body` stays as the plain-text fallback for callers that
+// have no template yet. Sending neither is what produced unstyled mail.
+async function sendEmail(to, subject, body, log, traceId, { template, data } = {}) {
   try {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 3000);
     const res = await fetch(`${NOTIFY_URL}/notify/email`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...(traceId ? { 'x-trace-id': traceId } : {}) },
-      body: JSON.stringify({ to, subject, body }),
+      body: JSON.stringify({ to, subject, body, ...(template ? { template, data: data || {} } : {}) }),
       signal: ctrl.signal
     });
     clearTimeout(timer);
-    log.info({ event: 'security_email_dispatched', to, subject, delivered: res.ok }, 'security email dispatched');
+    log.info({ event: 'security_email_dispatched', to, subject, template, delivered: res.ok }, 'security email dispatched');
     return res.ok;
   } catch (err) {
     log.warn({ event: 'security_email_failed', to, subject, message: err.message },
@@ -698,7 +701,15 @@ app.post('/auth/password/request', async (req, res, next) => {
     const otp = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
     const changeToken = signScopedToken(userId, 'change', CHANGE_TOKEN_TTL_MS, { otpHash: sha256(otp) });
     await sendEmail(account.email, 'Your Crumb & Ember verification code',
-      `Your password-change code is ${otp}. It expires in 10 minutes.`, req.log, req.traceId);
+      `Your password-change code is ${otp}. It expires in 10 minutes.`, req.log, req.traceId, {
+        template: 'verification-code',
+        data: {
+          code: otp,
+          purpose: 'password change',
+          expiresMinutes: Math.round(CHANGE_TOKEN_TTL_MS / 60000),
+          customerName: account.name
+        }
+      });
     req.log.info({ event: 'password_change_requested', userId, ip: info.ip, requestId: info.requestId }, 'change-password OTP emailed');
     audit.record({ ...info, action: 'change_password_request', userId, email: account.email, success: true, statusCode: 200 });
     const payload = { message: 'A verification code was emailed to you.', changeToken };
