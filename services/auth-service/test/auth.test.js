@@ -1,6 +1,10 @@
 'use strict';
 process.env.LOG_LEVEL = 'silent';
 process.env.AUTH_RETURN_DEBUG_TOKENS = 'true';
+// Short, deterministic session policy so the idle-timeout path is testable
+// without sleeping for minutes.
+process.env.AUTH_SESSION_IDLE_TIMEOUT_MS = '1200';
+process.env.AUTH_SESSION_ABSOLUTE_TTL_MS = '60000';
 
 const { test, before } = require('node:test');
 const assert = require('node:assert/strict');
@@ -139,6 +143,102 @@ test('session tokens are standards-compliant JWTs (HS256) with purpose + expiry'
   // be usable as sessions.
   const forged = `${parts[0]}.${parts[1]}.AAAA${parts[2].slice(4)}`;
   assert.equal((await fetch(base + '/auth/verify', { headers: { authorization: `Bearer ${forged}` } })).status, 401);
+});
+
+test('login issues a refresh token alongside a short-lived access token', async () => {
+  await register('refresh@test.dev', 'password123');
+  const body = await (await post('/auth/login', { email: 'refresh@test.dev', password: 'password123' })).json();
+
+  assert.ok(body.refreshToken, 'refresh token missing from login response');
+  assert.equal(body.tokenType, 'Bearer');
+  assert.ok(body.sessionId);
+  assert.equal(body.idleTimeoutMs, 1200);
+  assert.equal(body.absoluteTimeoutMs, 60000);
+  // The refresh token is <sessionId>.<secret> and the access token is bound
+  // to the same session via the `sid` claim.
+  assert.ok(body.refreshToken.startsWith(body.sessionId + '.'));
+  const claims = JSON.parse(Buffer.from(body.token.split('.')[1], 'base64url').toString());
+  assert.equal(claims.sid, body.sessionId);
+  assert.ok(claims.exp - claims.iat <= 15 * 60);
+});
+
+test('refresh rotates the token; replaying the old one kills the session', async () => {
+  await register('rotate@test.dev', 'password123');
+  const login = await (await post('/auth/login', { email: 'rotate@test.dev', password: 'password123' })).json();
+
+  const first = await post('/auth/refresh', { refreshToken: login.refreshToken });
+  assert.equal(first.status, 200);
+  const rotated = await first.json();
+  assert.ok(rotated.refreshToken && rotated.refreshToken !== login.refreshToken);
+  assert.equal((await fetch(base + '/auth/verify', { headers: { authorization: `Bearer ${rotated.token}` } })).status, 200);
+
+  // Replaying the consumed token is treated as theft: 401 + whole session dies.
+  const replay = await post('/auth/refresh', { refreshToken: login.refreshToken });
+  assert.equal(replay.status, 401);
+  assert.equal((await replay.json()).reason, 'refresh_token_reuse');
+
+  const afterReuse = await post('/auth/refresh', { refreshToken: rotated.refreshToken });
+  assert.equal(afterReuse.status, 401);
+});
+
+test('sessions expire after the idle timeout', async () => {
+  await register('idle@test.dev', 'password123');
+  const login = await (await post('/auth/login', { email: 'idle@test.dev', password: 'password123' })).json();
+
+  await new Promise((r) => setTimeout(r, 1400)); // > AUTH_SESSION_IDLE_TIMEOUT_MS
+  const res = await post('/auth/refresh', { refreshToken: login.refreshToken });
+  assert.equal(res.status, 401);
+  assert.equal((await res.json()).reason, 'session_idle_timeout');
+  assert.ok(audit.memoryRows().some((r) => r.action === 'session_timeout' && r.failure_reason === 'session_idle_timeout'));
+});
+
+test('logout revokes the refresh token so it can never be exchanged again', async () => {
+  await register('revoke@test.dev', 'password123');
+  const login = await (await post('/auth/login', { email: 'revoke@test.dev', password: 'password123' })).json();
+  const auth = { authorization: `Bearer ${login.token}` };
+
+  const out = await post('/auth/logout', {}, auth);
+  assert.equal(out.status, 200);
+  assert.equal((await out.json()).revoked, true);
+
+  const res = await post('/auth/refresh', { refreshToken: login.refreshToken });
+  assert.equal(res.status, 401);
+  assert.equal((await res.json()).reason, 'logout');
+});
+
+test('GET /auth/session reports remaining lifetime and verification state', async () => {
+  await register('poll@test.dev', 'password123');
+  const login = await (await post('/auth/login', { email: 'poll@test.dev', password: 'password123' })).json();
+  const auth = { authorization: `Bearer ${login.token}` };
+
+  const before = await (await fetch(base + '/auth/session', { headers: auth })).json();
+  assert.equal(before.active, true);
+  assert.equal(before.emailVerified, false);
+  assert.ok(before.expiresIn > 0);
+  assert.equal(before.idleTimeoutMs, 1200);
+
+  // The polling endpoint the verification screen uses flips on its own once
+  // the emailed link is confirmed — no page reload involved.
+  const status = await (await fetch(base + '/auth/verify-email/status', { headers: auth })).json();
+  assert.equal(status.emailVerified, false);
+  assert.ok(status.pollIntervalMs > 0);
+
+  const { verifyToken } = await (await post('/auth/verify-email/request', {}, auth)).json();
+  assert.equal((await post('/auth/verify-email/confirm', { token: verifyToken })).status, 200);
+
+  const after = await (await fetch(base + '/auth/verify-email/status', { headers: auth })).json();
+  assert.equal(after.emailVerified, true);
+});
+
+test('the verification link also confirms via GET (raw link pasted at the API)', async () => {
+  await register('getlink@test.dev', 'password123');
+  const login = await (await post('/auth/login', { email: 'getlink@test.dev', password: 'password123' })).json();
+  const auth = { authorization: `Bearer ${login.token}` };
+  const { verifyToken } = await (await post('/auth/verify-email/request', {}, auth)).json();
+
+  const res = await fetch(`${base}/auth/verify-email/confirm?token=${encodeURIComponent(verifyToken)}`);
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).emailVerified, true);
 });
 
 // Mirrors the browser's WebCrypto flow using node crypto.
