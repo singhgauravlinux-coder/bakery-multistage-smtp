@@ -73,6 +73,10 @@ commonLabels:
 
 
 
+
+
+# The verification email links back into the SPA, so the base URL has to be
+# this environment's public host or the link lands on the wrong stack.
 patches:
 - path: patch-ingress-host.yaml
   target:
@@ -114,9 +118,6 @@ patches:
   target:
     kind: Deployment
     name: notification-worker
-
-# The verification email links back into the SPA, so the base URL has to be
-# this environment's public host or the link lands on the wrong stack.
 - patch: |-
     apiVersion: apps/v1
     kind: Deployment
@@ -140,7 +141,7 @@ images:
   newTag: d30780b
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/api-gateway
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/api-gateway
-  newTag: d30780b
+  newTag: d615736
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/auth-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/auth-service
   newTag: f2b5fa5
