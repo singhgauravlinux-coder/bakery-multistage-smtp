@@ -68,7 +68,7 @@ images:
   newTag: d30780b
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/auth-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/auth-service
-  newTag: d30780b
+  newTag: f2b5fa5
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/baking-schedule-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/baking-schedule-service
   newTag: d30780b
