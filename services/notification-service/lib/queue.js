@@ -19,6 +19,8 @@ const MIGRATION = `
     max_attempts INTEGER NOT NULL DEFAULT 5,
     last_error   TEXT,
     trace_id     TEXT,
+    template     TEXT,
+    payload      JSONB,
     run_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     locked_by    TEXT,
     locked_at    TIMESTAMPTZ,
@@ -32,6 +34,7 @@ const MIGRATION = `
 // `id` is ambiguous inside UPDATE ... FROM claimed, so the claim query needs
 // the table-qualified variant; everything else uses the bare one.
 const cols = (p = '') => `${p}id, ${p}channel, ${p}recipient, ${p}subject, ${p}body, ${p}status,
+  ${p}template, ${p}payload,
   ${p}attempts, ${p}max_attempts AS "maxAttempts", ${p}last_error AS "lastError",
   ${p}trace_id AS "traceId", ${p}run_at AS "runAt",
   ${p}created_at AS "createdAt", ${p}updated_at AS "updatedAt"`;
@@ -48,11 +51,12 @@ function createQueue({ pool, logger }) {
 
     async init() { await pool.query(MIGRATION); },
 
-    async enqueue({ channel, recipient, subject, body, traceId, maxAttempts }) {
+    async enqueue({ channel, recipient, subject, body, traceId, maxAttempts, template, payload }) {
       const { rows } = await pool.query(
-        `INSERT INTO notification_jobs (id, channel, recipient, subject, body, trace_id, max_attempts)
-         VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7, 5)) RETURNING ${ROW}`,
-        [newJobId(), channel, recipient, subject || null, body || '', traceId || null, maxAttempts || null]);
+        `INSERT INTO notification_jobs (id, channel, recipient, subject, body, trace_id, max_attempts, template, payload)
+         VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7, 5),$8,$9) RETURNING ${ROW}`,
+        [newJobId(), channel, recipient, subject || null, body || '', traceId || null, maxAttempts || null,
+         template || null, payload ? JSON.stringify(payload) : null]);
       return rows[0];
     },
 
@@ -164,11 +168,12 @@ function memoryQueue({ logger }) {
   return {
     mode: 'memory',
     async init() {},
-    async enqueue({ channel, recipient, subject, body, traceId, maxAttempts }) {
+    async enqueue({ channel, recipient, subject, body, traceId, maxAttempts, template, payload }) {
       const job = {
         id: newJobId(), channel, recipient, subject: subject || null, body: body || '',
         status: 'queued', attempts: 0, maxAttempts: maxAttempts || 5, lastError: null,
-        traceId: traceId || null, runAt: now(), createdAt: now(), updatedAt: now()
+        traceId: traceId || null, template: template || null, payload: payload || null,
+        runAt: now(), createdAt: now(), updatedAt: now()
       };
       jobs.set(job.id, job);
       return job;

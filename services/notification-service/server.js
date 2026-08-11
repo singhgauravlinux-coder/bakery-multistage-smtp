@@ -5,6 +5,7 @@ const pino = require('pino');
 const pinoHttp = require('pino-http');
 const { Pool } = require('pg');
 const { createQueue } = require('./lib/queue');
+const { templateNames, render } = require('./lib/templates');
 
 const SERVICE_NAME = process.env.SERVICE_NAME || 'notification-service';
 const PORT = Number(process.env.PORT || 3000);
@@ -76,6 +77,26 @@ app.use(pinoHttp({
   }
 }));
 
+// Sample data for /notify/templates/:name/preview. Realistic values, so the
+// preview shows the layout under content of the length it will really carry.
+const SAMPLES = {
+  'verification-code': {
+    code: '561924', purpose: 'password change', expiresMinutes: 10, customerName: 'Gaurav'
+  },
+  'order-confirmation': {
+    orderId: 'CE-1042', customerName: 'Gaurav', currency: '₹',
+    items: [
+      { name: 'Sourdough, seeded', qty: 2, price: 320 },
+      { name: 'Cardamom bun', qty: 4, price: 480 },
+      { name: 'Salted butter, 200g', qty: 1, price: 210 }
+    ],
+    subtotal: 1010, delivery: 60, total: 1070,
+    readyAt: 'today from 4pm', fulfilment: 'delivery',
+    address: '14 Brigade Road, Bengaluru 560001',
+    orderUrl: 'https://crumb-and-ember.example/orders/CE-1042'
+  }
+};
+
 // --- Kubernetes probes -------------------------------------------------
 app.get('/health', (req, res) => res.json({ status: 'ok', service: SERVICE_NAME }));
 app.get('/ready', async (req, res) => {
@@ -94,8 +115,14 @@ app.get('/ready', async (req, res) => {
 // provider can no longer stall the caller's request thread.
 async function enqueueHandler(channel, req, res, next) {
   try {
-    const { to, subject, body, maxAttempts } = req.body || {};
+    const { to, subject, body, maxAttempts, template, data } = req.body || {};
     if (!to) return res.status(400).json({ error: 'recipient (to) is required' });
+    // Reject an unknown template at enqueue time. Catching it here gives the
+    // caller a 400 they can act on, instead of a job that queues cleanly and
+    // then dead-letters somewhere they are not looking.
+    if (template && !templateNames.includes(template)) {
+      return res.status(400).json({ error: `unknown template: ${template}`, available: templateNames });
+    }
 
     const job = await queue.enqueue({
       channel,
@@ -103,11 +130,13 @@ async function enqueueHandler(channel, req, res, next) {
       subject: subject ? String(subject) : null,
       body: body ? String(body) : '',
       traceId: req.traceId,
-      maxAttempts: Number.isInteger(maxAttempts) ? maxAttempts : undefined
+      maxAttempts: Number.isInteger(maxAttempts) ? maxAttempts : undefined,
+      template: template || undefined,
+      payload: data || undefined
     });
 
     req.log.info({
-      event: 'notification_enqueued', jobId: job.id, channel, to,
+      event: 'notification_enqueued', jobId: job.id, channel, to, template: template || undefined,
       subject: channel === 'email' ? (subject || '(no subject)') : undefined
     }, 'notification queued for delivery');
 
@@ -122,6 +151,19 @@ app.post('/notify/sms', (req, res, next) => enqueueHandler('sms', req, res, next
 
 // Delivery is asynchronous now, so callers (and on-call) need a way to see
 // where a given notification got to.
+// Render a template to HTML without sending anything — for designers
+// iterating on the mail and for a quick eyeball after a copy change.
+app.get('/notify/templates', (req, res) => res.json({ templates: templateNames }));
+app.get('/notify/templates/:name/preview', (req, res, next) => {
+  try {
+    const sample = SAMPLES[req.params.name];
+    if (!sample) return res.status(404).json({ error: 'Unknown template', available: templateNames });
+    const out = render(req.params.name, sample);
+    if (req.query.format === 'text') return res.type('text/plain').send(out.text);
+    res.type('html').send(out.html);
+  } catch (err) { next(err); }
+});
+
 app.get('/notify/jobs/:id', async (req, res, next) => {
   try {
     const job = await queue.get(req.params.id);
