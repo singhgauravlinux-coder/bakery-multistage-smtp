@@ -73,8 +73,6 @@ commonLabels:
 
 
 
-
-
 patches:
 - path: patch-ingress-host.yaml
   target:
@@ -88,6 +86,10 @@ patches:
   target:
     kind: Ingress
     name: bakery-db-ingress
+- path: patch-docs-ingress-host.yaml
+  target:
+    kind: Ingress
+    name: bakery-docs-ingress
 - patch: |-
     - op: replace
       path: /spec/template/spec/containers/0/resources
@@ -113,16 +115,35 @@ patches:
     kind: Deployment
     name: notification-worker
 
+# The verification email links back into the SPA, so the base URL has to be
+# this environment's public host or the link lands on the wrong stack.
+- patch: |-
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: auth-service
+    spec:
+      template:
+        spec:
+          containers:
+            - name: auth-service
+              env:
+                - name: APP_BASE_URL
+                  value: "http://dev.bakery.local"
+  target:
+    kind: Deployment
+    name: auth-service
+
 images:
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/analytics-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/analytics-service
   newTag: d30780b
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/api-gateway
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/api-gateway
-  newTag: 37677b7
+  newTag: d30780b
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/auth-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/auth-service
-  newTag: 37677b7
+  newTag: f2b5fa5
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/baking-schedule-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/baking-schedule-service
   newTag: d30780b
