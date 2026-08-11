@@ -84,9 +84,16 @@ services:
     build: ./services/api-gateway
     ports:
       - "3000:3000"
+      # Swagger UI on its own port, mirroring the k8s `api-docs` Service.
+      # Browse http://localhost:3100/api/docs — NOT http://localhost:3000/api/docs.
+      - "3100:3100"
     environment:
       <<: *node-env
       SERVICE_NAME: api-gateway
+      DOCS_PORT: "3100"
+      DOCS_SERVER_ENABLED: ${DOCS_SERVER_ENABLED:-true}
+      # Set to true only if you deliberately want the old inline /api/docs.
+      API_DOCS_ON_GATEWAY: ${API_DOCS_ON_GATEWAY:-false}
 
   # --------------------------------------------------------- domain services
   auth-service:
@@ -103,6 +110,14 @@ services:
       AUTH_RETURN_DEBUG_TOKENS: ${AUTH_RETURN_DEBUG_TOKENS:-true}
       DATABASE_URL: postgresql://${POSTGRES_USER:-bakery}:${POSTGRES_PASSWORD:-bakery}@postgres:5432/${POSTGRES_DB:-bakery}
       AUTH_TOKEN_SECRET: ${AUTH_TOKEN_SECRET:-local-dev-token-secret}
+      # Session policy: short access token + rotating refresh token, ended by
+      # whichever fires first, inactivity or the absolute ceiling.
+      AUTH_ACCESS_TOKEN_TTL_MS: ${AUTH_ACCESS_TOKEN_TTL_MS:-900000}
+      AUTH_REFRESH_TOKEN_TTL_MS: ${AUTH_REFRESH_TOKEN_TTL_MS:-604800000}
+      AUTH_SESSION_IDLE_TIMEOUT_MS: ${AUTH_SESSION_IDLE_TIMEOUT_MS:-1800000}
+      AUTH_SESSION_ABSOLUTE_TTL_MS: ${AUTH_SESSION_ABSOLUTE_TTL_MS:-43200000}
+      AUTH_VERIFY_POLL_INTERVAL_MS: ${AUTH_VERIFY_POLL_INTERVAL_MS:-5000}
+      APP_BASE_URL: ${APP_BASE_URL:-http://localhost:8080}
     depends_on:
       postgres:
         condition: service_healthy
