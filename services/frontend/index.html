@@ -262,6 +262,26 @@
   .hint.ok  { color: var(--pist); }
   .hint.err { color: var(--straw); }
 
+  /* --- session + email-verification UI ------------------------------- */
+  .panel-card { border: 3px solid var(--choc); border-radius: 14px; padding: 14px;
+    margin-bottom: 18px; background: #fff; box-shadow: 0 3px 0 var(--shadow); }
+  .panel-card.warn { background: #fff8ec; }
+  .state-pill { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px;
+    border: 2px solid var(--choc); padding: 3px 10px; font-size: 0.75rem; font-weight: 900;
+    letter-spacing: 0.04em; background: #fff; }
+  .state-pill.ok   { background: var(--pist); color: #fff; }
+  .state-pill.warn { background: var(--straw); color: #fff; }
+  .state-pill.muted { opacity: 0.6; }
+  .row-between { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .session-meter { height: 8px; border: 2px solid var(--choc); border-radius: 999px;
+    overflow: hidden; background: #fff; margin-top: 8px; }
+  .session-meter > i { display: block; height: 100%; background: var(--pist); width: 100%;
+    transition: width 900ms linear; }
+  .session-meter.low > i { background: var(--straw); }
+  /* Sits above drawers/modals: it can fire while another panel is open. */
+  #timeout-modal { z-index: 90; }
+  #timeout-modal .count { font-family: 'Space Mono', monospace; font-size: 2rem; font-weight: 700; }
+
   .modal { position: fixed; z-index: 60; top: 50%; left: 50%; transform: translate(-50%, -46%) scale(0.96);
     width: min(420px, 92vw); background: var(--milk); border: 3px solid var(--choc); border-radius: 24px;
     box-shadow: 0 12px 0 var(--shadow); opacity: 0; pointer-events: none;
@@ -563,12 +583,36 @@
 <aside class="drawer" id="account-drawer" aria-label="Account">
   <div class="head"><h2 class="display" id="acct-title">Account</h2><button class="x" data-close aria-label="Close">✕</button></div>
   <div class="scroll">
+    <!-- Email verification. This block polls /auth/verify-email/status while
+         the address is unverified, so clicking the link in a mail client (or
+         in another tab) flips it to Verified on its own — no manual reload. -->
+    <div class="panel-card" id="verify-panel" style="display:none">
+      <div class="row-between">
+        <strong>Email address</strong>
+        <span class="state-pill muted" id="verify-pill">Checking…</span>
+      </div>
+      <p class="hint" id="verify-email-label" style="margin-top:6px"></p>
+      <div id="verify-actions" style="display:none">
+        <button class="btn ghost" id="verify-send" style="width:100%; justify-content:center; margin-top:8px">Send verification link</button>
+      </div>
+      <p class="hint" id="verify-hint"></p>
+    </div>
     <p style="font-weight:900; margin-bottom:6px">Crumb Club</p>
     <p id="loyalty-line" style="font-weight:700">—</p>
     <p style="font-weight:900; margin:20px 0 6px">Baked for you</p>
     <div id="acct-recos"></div>
     <p style="font-weight:900; margin:20px 0 10px">Recent orders</p>
     <div id="order-list"></div>
+    <p style="font-weight:900; margin:20px 0 10px">Session</p>
+    <div class="panel-card" id="session-card">
+      <div class="row-between">
+        <span class="hint" id="session-line" style="margin:0">—</span>
+        <span class="state-pill" id="session-pill">active</span>
+      </div>
+      <div class="session-meter" id="session-meter"><i style="width:100%"></i></div>
+      <p class="hint" style="margin-bottom:0">Signed out automatically after a period of inactivity. Your access token renews itself in the background while you're using the shop.</p>
+      <button class="btn ghost" id="logout-all-btn" style="width:100%; justify-content:center; margin-top:10px">Sign out on all devices</button>
+    </div>
     <p style="font-weight:900; margin:20px 0 10px">Change password</p>
     <p class="hint" style="margin-bottom:10px">We'll email you a 6-digit code to confirm it's really you — same protection as the forgot-password flow.</p>
     <div id="pwd-step-request">
@@ -629,6 +673,18 @@
     <button class="btn pink" id="auth-submit" style="width:100%; justify-content:center">Sign in</button>
     <p class="hint" id="back-link" style="display:none; text-align:center; margin-top:10px"><a href="#" id="back-btn">‹ Back to sign in</a></p>
     <p class="hint" id="auth-hint"></p>
+  </div>
+</div>
+
+<!-- Shown shortly before the idle timeout fires, so a session never ends
+     without warning while someone is mid-checkout. -->
+<div class="modal" id="timeout-modal" role="alertdialog" aria-modal="true" aria-label="Session about to expire">
+  <div class="inner">
+    <h2 class="display" style="color:var(--straw); margin-bottom:10px">Still there?</h2>
+    <p style="font-weight:700; margin-bottom:6px">You've been idle for a while. For your security we'll sign you out in</p>
+    <p class="count" id="timeout-count">60s</p>
+    <button class="btn pink" id="timeout-stay" style="width:100%; justify-content:center; margin-top:12px">Keep me signed in</button>
+    <button class="btn ghost" id="timeout-out" style="width:100%; justify-content:center; margin-top:10px">Sign out now</button>
   </div>
 </div>
 
@@ -986,7 +1042,7 @@
       body: body === undefined ? undefined : JSON.stringify(body)
     }).then(function (r) { return r.json().then(function (b) { if (!r.ok) throw b; return b; }); });
   }
-  function sendAuthJSON(method, path, body) {
+  function rawAuthJSON(method, path, body) {
     return fetch(API + path, {
       method: method,
       headers: {
@@ -995,7 +1051,19 @@
         authorization: 'Bearer ' + (session && session.token)
       },
       body: body === undefined ? undefined : JSON.stringify(body)
-    }).then(function (r) { return r.json().then(function (b) { if (!r.ok) throw b; return b; }); });
+    }).then(function (r) { return r.json().catch(function () { return {}; }).then(function (b) { if (!r.ok) { b.status = r.status; throw b; } return b; }); });
+  }
+  /* Every authenticated call goes through here. It renews the access token
+     before the request when it is about to expire, and retries exactly once
+     if the server still says 401 — so a token expiring mid-session is
+     invisible to the user instead of surfacing as a random failure. */
+  function sendAuthJSON(method, path, body) {
+    return ensureFreshToken()
+      .then(function () { return rawAuthJSON(method, path, body); })
+      .catch(function (err) {
+        if (!err || err.status !== 401 || !session || !session.refreshToken) throw err;
+        return refreshSession().then(function () { return rawAuthJSON(method, path, body); });
+      });
   }
   /* --- Encrypted transport for sensitive payloads ---------------------
      Fetches the auth service's RSA public key once, then encrypts JSON
@@ -1084,10 +1152,316 @@
   function closePanels() {
     document.querySelectorAll('.drawer.open, .modal.show').forEach(function (el) { el.classList.remove('open', 'show'); });
     overlay.classList.remove('show');
+    // Verification polling only runs while the account panel is on screen.
+    if (typeof stopVerifyPolling === 'function') stopVerifyPolling();
   }
   overlay.addEventListener('click', closePanels);
   document.querySelectorAll('[data-close]').forEach(function (b) { b.addEventListener('click', closePanels); });
   document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closePanels(); });
+
+  /* ============================================================
+     SESSION — silent token renewal, idle timeout, cross-tab sync
+     ------------------------------------------------------------
+     The access token is short-lived and renewed in the background with a
+     rotating refresh token, so nothing in the UI depends on the user
+     reloading the page. Two deadlines end a session: inactivity (idle) and
+     a hard ceiling from login (absolute) — both decided by the server and
+     sent down with every login/refresh response.
+     ============================================================ */
+  var SESSION_KEY = 'crumb.session';
+  var REFRESH_SKEW_MS = 60 * 1000;        // renew this long before expiry
+  var WARN_BEFORE_MS = 60 * 1000;         // "still there?" lead time
+  var ACTIVE_WINDOW_MS = 5 * 60 * 1000;   // background renewal needs real activity
+  var DEFAULT_IDLE_MS = 30 * 60 * 1000;
+  var refreshInFlight = null;
+  var lastActivity = Date.now();
+
+  var authBus = null;
+  try { authBus = window.BroadcastChannel ? new BroadcastChannel('crumb.auth') : null; } catch (e) { authBus = null; }
+
+  function persistSession(broadcast) {
+    if (session) localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+    else localStorage.removeItem(SESSION_KEY);
+    if (broadcast !== false && authBus) authBus.postMessage({ type: 'session', session: session });
+  }
+  /* Normalises a login/refresh/session response into the local session
+     object. Fields the server didn't send are carried over, so a partial
+     response (e.g. /auth/session) never wipes the refresh token. */
+  function adoptSession(data, fallbackName) {
+    var now = Date.now();
+    var prev = session || {};
+    session = {
+      token: data.token || prev.token,
+      refreshToken: data.refreshToken || prev.refreshToken || null,
+      sessionId: data.sessionId || prev.sessionId || null,
+      userId: data.userId || prev.userId,
+      name: data.name || fallbackName || prev.name,
+      email: data.email || prev.email || null,
+      expiresAt: data.expiresAt ? Date.parse(data.expiresAt)
+        : (data.expiresIn ? now + Number(data.expiresIn) * 1000 : prev.expiresAt || null),
+      idleTimeoutMs: Number(data.idleTimeoutMs || prev.idleTimeoutMs || DEFAULT_IDLE_MS),
+      absoluteExpiresAt: data.absoluteExpiresAt ? Date.parse(data.absoluteExpiresAt) : (prev.absoluteExpiresAt || null),
+      emailVerified: typeof data.emailVerified === 'boolean' ? data.emailVerified : Boolean(prev.emailVerified)
+    };
+    lastActivity = Date.now();
+    persistSession();
+    return session;
+  }
+  function clearSession() {
+    session = null;
+    changeToken = null;
+    localStorage.removeItem(SESSION_KEY);
+    stopVerifyPolling();
+    hideTimeoutModal();
+    if (authBus) authBus.postMessage({ type: 'signout' });
+  }
+  function endSession(message, notifyServer) {
+    if (notifyServer && session) {
+      rawAuthJSON('POST', '/auth/logout', { refreshToken: session.refreshToken }).catch(function () {});
+    }
+    clearSession();
+    renderAuthState();
+    renderSessionCard();
+    renderVerifyPanel();
+    closePanels();
+    loadCart();
+    if (message) toast(message);
+  }
+  /* Single-flight: several parallel requests all wait on one refresh call,
+     which matters because refresh tokens are single-use — two concurrent
+     exchanges would look like a replay and kill the session. */
+  function refreshSession() {
+    if (!session || !session.refreshToken) return Promise.reject({ error: 'Not signed in', status: 401 });
+    if (refreshInFlight) return refreshInFlight;
+    var done = function (v) { refreshInFlight = null; return v; };
+    refreshInFlight = sendJSON('POST', '/auth/refresh', { refreshToken: session.refreshToken })
+      .then(function (data) {
+        adoptSession(data);
+        renderAuthState();
+        renderSessionCard();
+        renderVerifyPanel();
+        return session;
+      })
+      .catch(function (err) {
+        var reason = (err && err.reason) || '';
+        var timedOut = reason === 'session_idle_timeout' || reason === 'session_absolute_timeout';
+        endSession(timedOut ? 'Session timed out — please sign in again 🔒'
+          : 'Your session has ended — please sign in again');
+        throw err;
+      })
+      .then(done, function (e) { done(); throw e; });
+    return refreshInFlight;
+  }
+  function ensureFreshToken() {
+    if (!session) return Promise.reject({ error: 'Not signed in', status: 401 });
+    if (!session.refreshToken || !session.expiresAt) return Promise.resolve(session);
+    if (session.expiresAt - Date.now() > REFRESH_SKEW_MS) return Promise.resolve(session);
+    return refreshSession();
+  }
+
+  // ---- idle tracking -----------------------------------------------------
+  ['mousedown', 'keydown', 'touchstart', 'scroll', 'click'].forEach(function (evt) {
+    window.addEventListener(evt, function () { lastActivity = Date.now(); }, { passive: true });
+  });
+  // Coming back to the tab is not treated as activity on purpose: the point
+  // is to notice a session that died while the tab sat in the background.
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible') sessionTick();
+  });
+
+  function idleRemaining() {
+    if (!session) return 0;
+    return (session.idleTimeoutMs || DEFAULT_IDLE_MS) - (Date.now() - lastActivity);
+  }
+  function absoluteRemaining() {
+    if (!session || !session.absoluteExpiresAt) return Infinity;
+    return session.absoluteExpiresAt - Date.now();
+  }
+  function formatDuration(ms) {
+    var s = Math.max(0, Math.round(ms / 1000));
+    var m = Math.floor(s / 60);
+    return m > 0 ? m + 'm ' + (s % 60) + 's' : s + 's';
+  }
+  function sessionTick() {
+    if (!session) { hideTimeoutModal(); renderSessionCard(); return; }
+    var remaining = Math.min(idleRemaining(), absoluteRemaining());
+    if (remaining <= 0) { endSession('Signed out after inactivity 🔒', true); return; }
+    if (remaining <= WARN_BEFORE_MS) showTimeoutModal(remaining); else hideTimeoutModal();
+    // Background renewal only while the person is genuinely around —
+    // otherwise the timer alone would keep the server-side session alive
+    // forever and the idle timeout would never fire.
+    var recentlyActive = (Date.now() - lastActivity) < ACTIVE_WINDOW_MS;
+    if (recentlyActive && !refreshInFlight && session.expiresAt &&
+        session.expiresAt - Date.now() <= REFRESH_SKEW_MS) {
+      refreshSession().catch(function () {});
+    }
+    renderSessionCard(remaining);
+  }
+  setInterval(sessionTick, 1000);
+
+  function renderSessionCard(remaining) {
+    var line = document.getElementById('session-line');
+    var pill = document.getElementById('session-pill');
+    var meter = document.getElementById('session-meter');
+    if (!line || !pill || !meter) return;
+    var bar = meter.querySelector('i');
+    if (!session) {
+      line.textContent = 'Signed out';
+      pill.textContent = 'ended'; pill.className = 'state-pill muted';
+      if (bar) bar.style.width = '0%';
+      return;
+    }
+    var rem = remaining === undefined ? Math.min(idleRemaining(), absoluteRemaining()) : remaining;
+    var total = session.idleTimeoutMs || DEFAULT_IDLE_MS;
+    var pct = Math.max(0, Math.min(100, (rem / total) * 100));
+    line.textContent = 'Signs out in ' + formatDuration(rem);
+    pill.textContent = rem <= WARN_BEFORE_MS ? 'expiring' : 'active';
+    pill.className = 'state-pill ' + (rem <= WARN_BEFORE_MS ? 'warn' : 'ok');
+    meter.className = 'session-meter' + (pct < 20 ? ' low' : '');
+    if (bar) bar.style.width = pct.toFixed(1) + '%';
+  }
+
+  function showTimeoutModal(remaining) {
+    var el = document.getElementById('timeout-modal');
+    document.getElementById('timeout-count').textContent = Math.max(0, Math.ceil(remaining / 1000)) + 's';
+    if (!el.classList.contains('show')) { el.classList.add('show'); overlay.classList.add('show'); }
+  }
+  function hideTimeoutModal() {
+    var el = document.getElementById('timeout-modal');
+    if (!el || !el.classList.contains('show')) return;
+    el.classList.remove('show');
+    if (!document.querySelector('.drawer.open, .modal.show')) overlay.classList.remove('show');
+  }
+  document.getElementById('timeout-stay').addEventListener('click', function () {
+    lastActivity = Date.now();
+    hideTimeoutModal();
+    refreshSession().then(function () { toast('Session extended ✅'); }).catch(function () {});
+  });
+  document.getElementById('timeout-out').addEventListener('click', function () { endSession('Signed out', true); });
+
+  // ---- cross-tab sync ----------------------------------------------------
+  // Verifying (or signing out) in one tab updates every other open tab,
+  // which is the other half of "no manual refresh".
+  if (authBus) {
+    authBus.onmessage = function (ev) {
+      var msg = ev.data || {};
+      if (msg.type === 'signout') { session = null; }
+      else if (msg.type === 'session' && msg.session) { session = msg.session; }
+      else if (msg.type === 'verified' && session) { session.emailVerified = true; persistSession(false); }
+      renderAuthState(); renderSessionCard(); renderVerifyPanel();
+    };
+  }
+  window.addEventListener('storage', function (e) {
+    if (e.key !== SESSION_KEY) return;
+    try { session = e.newValue ? JSON.parse(e.newValue) : null; } catch (x) { session = null; }
+    renderAuthState(); renderSessionCard(); renderVerifyPanel();
+  });
+
+  /* ============================================================
+     EMAIL VERIFICATION — polls itself, never needs a page reload
+     ============================================================ */
+  var verifyTimer = null;
+  var verifyPollMs = 5000;
+  var verifyPollUntil = 0;
+
+  function renderVerifyPanel() {
+    var panel = document.getElementById('verify-panel');
+    if (!panel) return;
+    if (!session) { panel.style.display = 'none'; return; }
+    panel.style.display = 'block';
+    var pill = document.getElementById('verify-pill');
+    var actions = document.getElementById('verify-actions');
+    var label = document.getElementById('verify-email-label');
+    if (label) label.textContent = session.email || '';
+    if (session.emailVerified) {
+      pill.textContent = '✓ Verified'; pill.className = 'state-pill ok';
+      panel.classList.remove('warn');
+      actions.style.display = 'none';
+    } else {
+      pill.textContent = 'Not verified'; pill.className = 'state-pill warn';
+      panel.classList.add('warn');
+      actions.style.display = 'block';
+    }
+  }
+  function markVerified(silent) {
+    if (session) { session.emailVerified = true; persistSession(false); }
+    stopVerifyPolling();
+    renderVerifyPanel();
+    if (authBus) authBus.postMessage({ type: 'verified' });
+    var hint = document.getElementById('verify-hint');
+    if (hint) { hint.className = 'hint ok'; hint.textContent = 'Your email address is verified.'; }
+    if (!silent) toast('Email verified ✅');
+  }
+  /* Deliberately uses the raw (non-renewing) call: polling must not keep a
+     session alive by itself, or the idle timeout would never be reached. */
+  function pollVerifyStatus() {
+    if (!session || session.emailVerified || Date.now() > verifyPollUntil) { stopVerifyPolling(); return; }
+    rawAuthJSON('GET', '/auth/verify-email/status')
+      .then(function (d) {
+        if (d && d.pollIntervalMs) verifyPollMs = d.pollIntervalMs;
+        if (d && d.email && session && session.email !== d.email) { session.email = d.email; persistSession(false); renderVerifyPanel(); }
+        if (d && d.emailVerified) markVerified();
+      })
+      .catch(function () {});
+  }
+  function startVerifyPolling() {
+    stopVerifyPolling();
+    if (!session || session.emailVerified) return;
+    verifyPollUntil = Date.now() + 15 * 60 * 1000; // bounded; restarted on demand
+    pollVerifyStatus();
+    verifyTimer = setInterval(pollVerifyStatus, verifyPollMs);
+  }
+  function stopVerifyPolling() { if (verifyTimer) { clearInterval(verifyTimer); verifyTimer = null; } }
+
+  function confirmVerifyToken(token) {
+    return sendJSON('POST', '/auth/verify-email/confirm', { token: token })
+      .then(function () { markVerified(true); return true; })
+      .catch(function (e) {
+        var hint = document.getElementById('verify-hint');
+        if (hint) { hint.className = 'hint err'; hint.textContent = (e && e.error) || 'Verification link is invalid or has expired.'; }
+        return false;
+      });
+  }
+  /* The link in the email lands on ?verify=<token>. Confirm it, strip the
+     token out of the address bar (so a reload or a leaked referrer can't
+     replay it) and update the badge in place. */
+  function consumeVerifyLinkFromUrl() {
+    var params = new URLSearchParams(window.location.search);
+    var token = params.get('verify');
+    if (!token) return;
+    params.delete('verify');
+    var qs = params.toString();
+    window.history.replaceState({}, document.title,
+      window.location.pathname + (qs ? '?' + qs : '') + window.location.hash);
+    confirmVerifyToken(token).then(function (ok) {
+      if (!ok) { toast('That verification link has expired'); return; }
+      toast('Email verified ✅');
+      if (session) openAccount();
+    });
+  }
+
+  document.getElementById('verify-send').addEventListener('click', function () {
+    var hint = document.getElementById('verify-hint');
+    if (!apiUp || !session) { hint.className = 'hint err'; hint.textContent = 'You must be signed in.'; return; }
+    hint.className = 'hint'; hint.textContent = 'Sending…';
+    sendAuthJSON('POST', '/auth/verify-email/request', {})
+      .then(function (d) {
+        if (d && d.pollIntervalMs) verifyPollMs = d.pollIntervalMs;
+        if (d && d.ok) { markVerified(); return; }
+        hint.className = 'hint ok';
+        hint.textContent = 'Link sent — this panel updates by itself once you open it.';
+        // Demo stacks return the token so the flow is testable without a
+        // real inbox; offer it as a one-click shortcut.
+        if (d && d.verifyToken) {
+          var a = document.createElement('a');
+          a.href = '#'; a.textContent = ' verify now (dev)';
+          a.addEventListener('click', function (ev) { ev.preventDefault(); confirmVerifyToken(d.verifyToken); });
+          hint.appendChild(a);
+        }
+        startVerifyPolling();
+      })
+      .catch(function (e) { hint.className = 'hint err'; hint.textContent = (e && e.error) || 'Could not send the link.'; });
+  });
 
   /* ============================================================
      AUTH
@@ -1196,8 +1570,12 @@
   function doLogin(email, pass) {
     return sendSecureJSON('POST', '/auth/login', { email: email, password: pass }).then(function (data) {
       var guestItems = cart.slice();
-      session = { token: data.token, userId: data.userId, name: data.name || email.split('@')[0] };
-      localStorage.setItem('crumb.session', JSON.stringify(session));
+      // data carries token + refreshToken + both timeout deadlines.
+      adoptSession(data, email.split('@')[0]);
+      if (!session.email) { session.email = email; persistSession(false); }
+      renderSessionCard();
+      renderVerifyPanel();
+      if (!session.emailVerified) startVerifyPolling();
       // Credentials are no longer needed once the JWT is issued — wipe the
       // inputs so they can't be read from the DOM or a reopened panel.
       ['auth-email', 'auth-pass', 'reg-name'].forEach(function (id) {
@@ -1251,28 +1629,51 @@
         document.getElementById('pwd-new').value = '';
         document.getElementById('pwd-step-confirm').style.display = 'none';
         document.getElementById('pwd-step-request').style.display = 'block';
-        toast('Password updated 🔐');
+        // Changing the password revokes every session server-side, so sign
+        // back in rather than leaving the UI holding dead tokens.
+        endSession('Password updated — please sign in again 🔐');
       })
       .catch(function (e) { hint.className = 'hint err'; hint.textContent = e.error || 'Could not update password.'; });
   });
 
+  // Sign-out revokes the refresh token server-side (and is audited there).
   document.getElementById('logout-btn').addEventListener('click', function () {
-    if (apiUp && session) sendAuthJSON('POST', '/auth/logout').catch(function () {}); // audited server-side
-    session = null;
-    changeToken = null;
-    localStorage.removeItem('crumb.session');
-    renderAuthState();
-    closePanels();
-    loadCart();
-    toast('Signed out');
+    endSession('Signed out', apiUp);
   });
 
-  if (session) {
-    fetch(API + '/auth/verify', { headers: { authorization: 'Bearer ' + session.token } })
-      .then(function (r) { if (!r.ok) throw 0; renderAuthState(); })
-      .catch(function () { session = null; localStorage.removeItem('crumb.session'); renderAuthState(); });
+  document.getElementById('logout-all-btn').addEventListener('click', function () {
+    if (!apiUp || !session) { endSession('Signed out'); return; }
+    sendAuthJSON('POST', '/auth/logout-all', {})
+      .catch(function () {})
+      .then(function () { endSession('Signed out on all devices 🔒'); });
+  });
+
+  /* Rehydrate on load: ask the server how much of this session is left and
+     whether the email has been verified since last time, rather than
+     trusting whatever localStorage happens to hold. */
+  function bootstrapSession() {
+    renderSessionCard();
+    renderVerifyPanel();
+    if (!session) { renderAuthState(); consumeVerifyLinkFromUrl(); return; }
+    sendAuthJSON('GET', '/auth/session')
+      .then(function (d) {
+        adoptSession({
+          expiresAt: d.expiresAt, idleTimeoutMs: d.idleTimeoutMs,
+          absoluteExpiresAt: d.absoluteExpiresAt, emailVerified: d.emailVerified,
+          userId: d.userId, name: d.name, email: d.email, sessionId: d.sessionId
+        });
+        if (!d.emailVerified) startVerifyPolling();
+      })
+      .catch(function () { clearSession(); })
+      .then(function () {
+        renderAuthState();
+        renderSessionCard();
+        renderVerifyPanel();
+        consumeVerifyLinkFromUrl();
+      });
   }
   renderAuthState();
+  bootstrapSession();
 
   /* ============================================================
      OVEN RAIL
@@ -1630,6 +2031,11 @@
   function openAccount() {
     document.getElementById('acct-title').textContent = session.name || session.userId;
     openPanel('account-drawer');
+
+    // Session meter + verification badge are live while this panel is open.
+    renderSessionCard();
+    renderVerifyPanel();
+    if (!session.emailVerified) startVerifyPolling();
 
     getJSON('/loyalty/' + session.userId).then(function (l) {
       document.getElementById('loyalty-line').innerHTML =
