@@ -94,6 +94,46 @@ const SAMPLES = {
     readyAt: 'today from 4pm', fulfilment: 'delivery',
     address: '14 Brigade Road, Bengaluru 560001',
     orderUrl: 'https://crumb-and-ember.example/orders/CE-1042'
+  },
+  // Promotional samples. Every one carries an unsubscribeUrl because the
+  // marketing footer renders it unconditionally — a preview without it would
+  // hide the one link that is legally required to be there.
+  'promo-offer': {
+    customerName: 'Gaurav', currency: '₹',
+    headline: 'Weekend treat, warm from the oven',
+    subhead: 'Two days only — the sourdough shelf and everything on it.',
+    offerLine: '20% off your whole basket',
+    code: 'CRUMB20', expiresOn: 'Sunday 9pm',
+    ctaLabel: 'Order now',   // ctaUrl omitted on purpose: resolves to APP_BASE_URL + /shop
+    items: [
+      { name: 'Country sourdough', price: 180, wasPrice: 220, note: '48-hour ferment, dark crust' },
+      { name: 'Cardamom bun', price: 120, wasPrice: 150, note: 'Friday and Saturday only' },
+      { name: 'Almond croissant', price: 160, wasPrice: 200 },
+      { name: 'Pistachio babka', price: 340, wasPrice: 420, note: 'Half loaf' }
+    ],
+    unsubscribeUrl: 'unsubscribe/sample-token'   // path; joined onto APP_BASE_URL
+  },
+  'promo-new-arrivals': {
+    currency: '₹',
+    headline: 'Fresh on the shelf this week',
+    subhead: 'Four new bakes, out of the oven from Thursday morning.',
+    note: 'Pre-order before Wednesday and we will hold one back for you.',
+    ctaLabel: 'See the menu',   // resolves to APP_BASE_URL + /menu
+    items: [
+      { name: 'Miso caramel cruffin', price: 190, note: 'New' },
+      { name: 'Rye and fennel loaf', price: 210 },
+      { name: 'Burnt basque cheesecake', price: 260, note: 'Slice or whole' },
+      { name: 'Cold brew tonic', price: 150 }
+    ],
+    unsubscribeUrl: 'unsubscribe/sample-token'   // path; joined onto APP_BASE_URL
+  },
+  'promo-loyalty-reward': {
+    customerName: 'Gaurav', currency: '₹',
+    points: 1240, tier: 'Golden Crust',
+    rewardLine: 'A free coffee, on us',
+    code: 'CLUBFREE', expiresOn: '31 August',
+    ctaLabel: 'Redeem now',   // resolves to APP_BASE_URL + /account/rewards
+    unsubscribeUrl: 'unsubscribe/sample-token'   // path; joined onto APP_BASE_URL
   }
 };
 
