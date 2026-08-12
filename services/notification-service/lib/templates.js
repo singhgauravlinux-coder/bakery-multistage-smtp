@@ -196,7 +196,7 @@ function verificationCode(data = {}) {
               <tr>
                 <td style="background-color:${C.pink};border-left:4px solid ${C.straw};border-radius:0 10px 10px 0;padding:14px 16px;">
                   <div style="font-family:${F_BODY};font-size:14px;line-height:1.6;color:${C.choc};">
-                    Didn't ask for this? Ignore the email — nothing changes without the code. Nobody from Crumb &amp; Ember will ever ask you for it.
+                    Didn't ask for this? Ignore the email — nothing changes without the code. Nobody from Crumb &amp; Ember will ever ask you for it.${supportHtml(data, 'Unexpected verification code')}
                   </div>
                 </td>
               </tr>
@@ -208,7 +208,7 @@ function verificationCode(data = {}) {
     `Your Crumb & Ember code is ${code}.`,
     `It confirms your ${purpose} and expires in ${minutes} minutes.`,
     '',
-    "Didn't ask for this? Ignore this email — nothing changes without the code.",
+    `Didn't ask for this? Ignore this email — nothing changes without the code.${supportText(data)}`,
     'Nobody from Crumb & Ember will ever ask you for it.'
   ].join('\n');
 
@@ -366,6 +366,31 @@ const linkTo = (data, explicit, defaultPath) => {
 // An empty string means "no destination configured"; buttons fall back to '#'
 // so the markup stays valid, but the text part drops the line entirely.
 const href = (u) => u || '#';
+
+// --- support contact -------------------------------------------------------
+// Every security mail should end with a way to report it. "Ignore this email"
+// alone is only half the advice: an unexpected reset mail may be the first
+// sign someone is probing the account, and the customer needs somewhere to
+// say so. The address comes from MAIL_SUPPORT, so none is committed here.
+const SUPPORT_EMAIL = process.env.MAIL_SUPPORT || '';
+
+const supportAddress = (data = {}) => data.supportEmail || SUPPORT_EMAIL || '';
+
+// A mailto with a prefilled subject, so a report arrives already labelled.
+// Returns '' when unconfigured — saying nothing beats pointing a worried
+// customer at a dead address.
+const supportHtml = (data = {}, subject = 'Unexpected account email') => {
+  const addr = supportAddress(data);
+  if (!addr) return '';
+  const mailto = `mailto:${addr}?subject=${encodeURIComponent(subject)}`;
+  return ` If this wasn't done by you, report it to <a href="${esc(mailto)}" style="color:${C.choc};font-weight:700;text-decoration:underline;">${esc(addr)}</a>.`;
+};
+
+// Plain-text equivalent for the multipart alternative.
+const supportText = (data = {}) => {
+  const addr = supportAddress(data);
+  return addr ? ` If this wasn't done by you, report it to ${addr}.` : '';
+};
 
 
 // Big CTA. Table-wrapped rather than a styled <a> because Outlook ignores
@@ -650,9 +675,164 @@ function promoLoyaltyReward(data = {}) {
   };
 }
 
+// --- password reset --------------------------------------------------------
+// Security mail, so the accent is strawberry (alarm-adjacent, distinct from
+// the pistachio of order confirmations) and the copy leads with what to do,
+// then what to do if it wasn't you. The raw URL is repeated below the button:
+// some clients strip buttons, and a reset mail with no reachable link is the
+// exact failure this template exists to prevent.
+function passwordReset(data = {}) {
+  const minutes = Number(data.expiresMinutes || 15);
+  const url = linkTo(data, data.resetUrl, data.token ? `reset-password?token=${encodeURIComponent(data.token)}` : 'reset-password');
+  const greeting = data.customerName ? `${esc(data.customerName)}, let's` : "Let's";
+  const accent = C.straw;
+
+  const body = `
+        <tr>
+          <td style="background-color:${C.milk};padding:10px 32px 0 32px;">
+            <h1 style="margin:0;font-family:${F_BODY};font-size:28px;line-height:1.25;font-weight:800;color:${C.choc};">
+              ${greeting} get you back in
+            </h1>
+            <p style="margin:12px 0 0 0;font-family:${F_BODY};font-size:16px;line-height:1.6;color:${C.cocoa};">
+              Someone asked to reset the password for this account. Tap the button below to choose a new one.
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td align="center" style="background-color:${C.milk};padding:24px 32px 0 32px;">
+            ${cta(url, data.ctaLabel || 'Reset my password', accent)}
+          </td>
+        </tr>
+        <tr>
+          <td style="background-color:${C.milk};padding:18px 32px 0 32px;">
+            <div style="font-family:${F_MONO};font-size:12px;letter-spacing:1px;color:${C.cocoa};text-align:center;">
+              THIS LINK EXPIRES IN ${esc(minutes)} MINUTES
+            </div>
+          </td>
+        </tr>
+        ${url ? `
+        <tr>
+          <td style="background-color:${C.milk};padding:20px 32px 0 32px;">
+            <div style="font-family:${F_BODY};font-size:13px;color:${C.cocoa};line-height:1.6;">
+              Button not working? Paste this into your browser:
+            </div>
+            <div style="font-family:${F_MONO};font-size:12px;color:${C.choc};line-height:1.5;word-break:break-all;padding-top:6px;">
+              ${esc(url)}
+            </div>
+          </td>
+        </tr>` : ''}
+        <tr>
+          <td style="background-color:${C.milk};padding:22px 32px 32px 32px;">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+              <tr>
+                <td style="background-color:${C.pink};border-left:4px solid ${C.butter};border-radius:0 10px 10px 0;padding:14px 16px;">
+                  <div style="font-family:${F_BODY};font-size:14px;line-height:1.6;color:${C.choc};">
+                    Didn't ask for this? Ignore this email — your password stays as it is, and the link above will expire on its own.${supportHtml(data, 'Unexpected password reset email')}
+                  </div>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>`;
+
+  const text = [
+    `${data.customerName ? `${data.customerName}, let's` : "Let's"} get you back in.`,
+    '',
+    'Someone asked to reset the password for this account.',
+    url ? `Reset it here: ${url}` : '',
+    `This link expires in ${minutes} minutes.`,
+    '',
+    `Didn't ask for this? Ignore this email — your password stays as it is.${supportText(data)}`
+  ].filter(Boolean).join('\n');
+
+  return {
+    subject: data.subject || 'Reset your Crumb & Ember password',
+    html: shell('Reset your password', accent, { eyebrow: 'Password reset', body },
+      data.preheader || `Reset your password — link expires in ${minutes} minutes`),
+    text
+  };
+}
+
+// --- email verification ----------------------------------------------------
+// Butter accent: this is a welcome-ish, low-stakes confirmation rather than a
+// security alarm. Same belt-and-braces raw URL as the reset mail.
+function emailVerification(data = {}) {
+  const minutes = Number(data.expiresMinutes || 15);
+  const url = linkTo(data, data.verifyUrl, data.token ? `?verify=${encodeURIComponent(data.token)}` : '');
+  const greeting = data.customerName ? `${esc(data.customerName)}, one` : 'One';
+  const accent = C.butter;
+
+  const body = `
+        <tr>
+          <td style="background-color:${C.milk};padding:10px 32px 0 32px;">
+            <h1 style="margin:0;font-family:${F_BODY};font-size:28px;line-height:1.25;font-weight:800;color:${C.choc};">
+              ${greeting} tap and you're in
+            </h1>
+            <p style="margin:12px 0 0 0;font-family:${F_BODY};font-size:16px;line-height:1.6;color:${C.cocoa};">
+              Confirm ${data.email ? `<span style="color:${C.choc};font-weight:700;">${esc(data.email)}</span>` : 'this address'} so we can send you order updates — and the occasional word about what's coming out of the oven.
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td align="center" style="background-color:${C.milk};padding:24px 32px 0 32px;">
+            ${cta(url, data.ctaLabel || 'Verify my email', C.straw)}
+          </td>
+        </tr>
+        <tr>
+          <td style="background-color:${C.milk};padding:18px 32px 0 32px;">
+            <div style="font-family:${F_MONO};font-size:12px;letter-spacing:1px;color:${C.cocoa};text-align:center;">
+              THIS LINK EXPIRES IN ${esc(minutes)} MINUTES
+            </div>
+          </td>
+        </tr>
+        ${url ? `
+        <tr>
+          <td style="background-color:${C.milk};padding:20px 32px 0 32px;">
+            <div style="font-family:${F_BODY};font-size:13px;color:${C.cocoa};line-height:1.6;">
+              Button not working? Paste this into your browser:
+            </div>
+            <div style="font-family:${F_MONO};font-size:12px;color:${C.choc};line-height:1.5;word-break:break-all;padding-top:6px;">
+              ${esc(url)}
+            </div>
+          </td>
+        </tr>` : ''}
+        <tr>
+          <td style="background-color:${C.milk};padding:22px 32px 32px 32px;">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+              <tr>
+                <td style="background-color:${C.pink};border-left:4px solid ${accent};border-radius:0 10px 10px 0;padding:14px 16px;">
+                  <div style="font-family:${F_BODY};font-size:14px;line-height:1.6;color:${C.choc};">
+                    Didn't create an account with us? No action needed — just ignore this email.${supportHtml(data, 'Unexpected verification email')}
+                  </div>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>`;
+
+  const text = [
+    `${data.customerName ? `${data.customerName}, one` : 'One'} tap and you're in.`,
+    '',
+    `Confirm ${data.email || 'this address'} so we can send you order updates.`,
+    url ? `Verify here: ${url}` : '',
+    `This link expires in ${minutes} minutes.`,
+    '',
+    `Didn't create an account with us? Just ignore this email.${supportText(data)}`
+  ].filter(Boolean).join('\n');
+
+  return {
+    subject: data.subject || 'Verify your Crumb & Ember email',
+    html: shell('Verify your email', accent, { eyebrow: 'Confirm your email', body },
+      data.preheader || `Confirm your email — link expires in ${minutes} minutes`),
+    text
+  };
+}
+
 const TEMPLATES = {
   'verification-code': verificationCode,
   'order-confirmation': orderConfirmation,
+  'password-reset': passwordReset,
+  'email-verification': emailVerification,
   'promo-offer': promoOffer,
   'promo-new-arrivals': promoNewArrivals,
   'promo-loyalty-reward': promoLoyaltyReward
