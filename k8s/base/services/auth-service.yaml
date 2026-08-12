@@ -26,6 +26,10 @@ spec:
         - name: auth-service
           image: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/auth-service:2e71aee
           imagePullPolicy: Always
+          envFrom:
+            - secretRef:
+                name: bakery-public-urls
+                optional: true
           ports:
             - containerPort: 3001
           securityContext:
@@ -64,9 +68,11 @@ spec:
             - name: AUTH_SESSION_ABSOLUTE_TTL_MS
               value: "43200000"      # 12 hours from sign-in
             # Public origin used to build the link inside verification
-            # emails. Must match the host users actually browse.
-            - name: APP_BASE_URL
-              value: "http://bakery.local"
+            # emails. Must match the host users actually browse. Supplied by
+            # the bakery-public-urls Secret (envFrom above) — see
+            # docs/PUBLIC_URLS.md. No default here on purpose: if the Secret
+            # is missing, verifyLink should fail loudly rather than silently
+            # point at bakery.local.
             - name: AUTH_VERIFY_POLL_INTERVAL_MS
               value: "5000"
           readinessProbe:
