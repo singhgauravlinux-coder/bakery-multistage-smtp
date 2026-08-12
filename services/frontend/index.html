@@ -273,14 +273,26 @@
   .state-pill.warn { background: var(--straw); color: #fff; }
   .state-pill.muted { opacity: 0.6; }
   .row-between { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-  .session-meter { height: 8px; border: 2px solid var(--choc); border-radius: 999px;
-    overflow: hidden; background: #fff; margin-top: 8px; }
-  .session-meter > i { display: block; height: 100%; background: var(--pist); width: 100%;
-    transition: width 900ms linear; }
-  .session-meter.low > i { background: var(--straw); }
-  /* Sits above drawers/modals: it can fire while another panel is open. */
-  #timeout-modal { z-index: 90; }
-  #timeout-modal .count { font-family: 'Space Mono', monospace; font-size: 2rem; font-weight: 700; }
+  /* Session dialogs sit above every drawer/modal: they can fire while any
+     other panel is open, and they must not be dismissable by clicking away. */
+  #timeout-modal, #loggedout-modal { z-index: 95; width: min(460px, 94vw); text-align: center; }
+  #timeout-modal .inner, #loggedout-modal .inner { padding: 0 0 28px 0; }
+  /* Depleting bar across the top — the CRM pattern: you can see the time
+     draining rather than having to read a number. */
+  .timeout-bar { height: 14px; background: var(--pink); border-radius: 20px 20px 0 0;
+    overflow: hidden; border-bottom: 3px solid var(--choc); }
+  .timeout-bar > i { display: block; height: 100%; width: 100%; background: var(--pist);
+    transition: width 1000ms linear; }
+  .timeout-bar.low > i { background: var(--straw); }
+  .session-title { font-family: 'Space Mono', monospace; font-weight: 700; letter-spacing: 2px;
+    font-size: 1.15rem; color: var(--choc); padding: 26px 24px 0; text-transform: uppercase; }
+  .session-sub { font-size: 0.82rem; color: var(--cocoa); padding-top: 6px; font-weight: 700; }
+  .session-body { padding: 16px 28px 0; font-weight: 700; line-height: 1.6; color: var(--choc); }
+  .session-count { font-family: 'Space Mono', monospace; font-size: 2.6rem; font-weight: 700;
+    color: var(--straw); padding-top: 10px; line-height: 1; }
+  .session-actions { display: flex; gap: 10px; justify-content: center; padding: 22px 24px 0; flex-wrap: wrap; }
+  .session-actions .btn { flex: 1 1 160px; justify-content: center; }
+  .timeout-clock { font-size: 3.4rem; padding-top: 22px; line-height: 1; }
 
   .modal { position: fixed; z-index: 60; top: 50%; left: 50%; transform: translate(-50%, -46%) scale(0.96);
     width: min(420px, 92vw); background: var(--milk); border: 3px solid var(--choc); border-radius: 24px;
@@ -603,16 +615,6 @@
     <div id="acct-recos"></div>
     <p style="font-weight:900; margin:20px 0 10px">Recent orders</p>
     <div id="order-list"></div>
-    <p style="font-weight:900; margin:20px 0 10px">Session</p>
-    <div class="panel-card" id="session-card">
-      <div class="row-between">
-        <span class="hint" id="session-line" style="margin:0">—</span>
-        <span class="state-pill" id="session-pill">active</span>
-      </div>
-      <div class="session-meter" id="session-meter"><i style="width:100%"></i></div>
-      <p class="hint" style="margin-bottom:0">Signed out automatically after a period of inactivity. Your access token renews itself in the background while you're using the shop.</p>
-      <button class="btn ghost" id="logout-all-btn" style="width:100%; justify-content:center; margin-top:10px">Sign out on all devices</button>
-    </div>
     <p style="font-weight:900; margin:20px 0 10px">Change password</p>
     <p class="hint" style="margin-bottom:10px">We'll email you a 6-digit code to confirm it's really you — same protection as the forgot-password flow.</p>
     <div id="pwd-step-request">
@@ -676,15 +678,39 @@
   </div>
 </div>
 
-<!-- Shown shortly before the idle timeout fires, so a session never ends
-     without warning while someone is mid-checkout. -->
-<div class="modal" id="timeout-modal" role="alertdialog" aria-modal="true" aria-label="Session about to expire">
+<!-- Stage 1: the warning. Fires shortly before the idle timeout so a session
+     never ends without notice mid-checkout. Deliberately NOT dismissable by
+     clicking the overlay or pressing Escape — an accidental dismissal would
+     look like "kept signed in" while the clock kept running. -->
+<div class="modal" id="timeout-modal" role="alertdialog" aria-modal="true"
+     aria-labelledby="timeout-title" aria-describedby="timeout-desc">
   <div class="inner">
-    <h2 class="display" style="color:var(--straw); margin-bottom:10px">Still there?</h2>
-    <p style="font-weight:700; margin-bottom:6px">You've been idle for a while. For your security we'll sign you out in</p>
-    <p class="count" id="timeout-count">60s</p>
-    <button class="btn pink" id="timeout-stay" style="width:100%; justify-content:center; margin-top:12px">Keep me signed in</button>
-    <button class="btn ghost" id="timeout-out" style="width:100%; justify-content:center; margin-top:10px">Sign out now</button>
+    <div class="timeout-bar" id="timeout-bar"><i></i></div>
+    <div class="session-title" id="timeout-title">Security Warning</div>
+    <div class="session-sub">(Automatic Logout)</div>
+    <p class="session-body" id="timeout-desc">
+      There has been no activity in your session for a long time. You are about to be signed out.
+      What would you like to do?
+    </p>
+    <div class="session-count" id="timeout-count" aria-live="off">60</div>
+    <div class="session-actions">
+      <button class="btn pink" id="timeout-stay">Continue exploring</button>
+      <button class="btn ghost" id="timeout-out">Log out now</button>
+    </div>
+  </div>
+</div>
+
+<!-- Stage 2: confirmation that the session actually ended. Shown only for an
+     automatic timeout, never for a deliberate sign-out — someone who clicked
+     "Log out" does not need telling what just happened. -->
+<div class="modal" id="loggedout-modal" role="alertdialog" aria-modal="true" aria-labelledby="loggedout-title">
+  <div class="inner">
+    <div class="timeout-clock" aria-hidden="true">⏱️</div>
+    <div class="session-title" id="loggedout-title" style="padding-top:14px">Timeout Warning</div>
+    <p class="session-body">You have been signed out for security reasons.</p>
+    <div class="session-actions">
+      <button class="btn pink" id="loggedout-close">Close</button>
+    </div>
   </div>
 </div>
 
@@ -1149,9 +1175,18 @@
     el.classList.add(el.classList.contains('modal') ? 'show' : 'open');
     overlay.classList.add('show');
   }
+  // The two session dialogs are deliberately excluded from the generic close
+  // path: an accidental overlay click or Escape must not dismiss a warning
+  // that is still counting down (it would look like "kept signed in" while
+  // the clock kept running), nor the logged-out notice. Both close only via
+  // their own buttons.
+  var STICKY_MODALS = ['timeout-modal', 'loggedout-modal'];
   function closePanels() {
-    document.querySelectorAll('.drawer.open, .modal.show').forEach(function (el) { el.classList.remove('open', 'show'); });
-    overlay.classList.remove('show');
+    document.querySelectorAll('.drawer.open, .modal.show').forEach(function (el) {
+      if (STICKY_MODALS.indexOf(el.id) !== -1) return;
+      el.classList.remove('open', 'show');
+    });
+    if (!document.querySelector('.drawer.open, .modal.show')) overlay.classList.remove('show');
     // Verification polling only runs while the account panel is on screen.
     if (typeof stopVerifyPolling === 'function') stopVerifyPolling();
   }
@@ -1215,7 +1250,7 @@
     hideTimeoutModal();
     if (authBus) authBus.postMessage({ type: 'signout' });
   }
-  function endSession(message, notifyServer) {
+  function endSession(message, notifyServer, timedOut) {
     if (notifyServer && session) {
       rawAuthJSON('POST', '/auth/logout', { refreshToken: session.refreshToken }).catch(function () {});
     }
@@ -1225,7 +1260,8 @@
     renderVerifyPanel();
     closePanels();
     loadCart();
-    if (message) toast(message);
+    if (timedOut) showLoggedOutModal();
+    else if (message) toast(message);
   }
   /* Single-flight: several parallel requests all wait on one refresh call,
      which matters because refresh tokens are single-use — two concurrent
@@ -1245,8 +1281,7 @@
       .catch(function (err) {
         var reason = (err && err.reason) || '';
         var timedOut = reason === 'session_idle_timeout' || reason === 'session_absolute_timeout';
-        endSession(timedOut ? 'Session timed out — please sign in again 🔒'
-          : 'Your session has ended — please sign in again');
+        endSession(timedOut ? null : 'Your session has ended — please sign in again', false, timedOut);
         throw err;
       })
       .then(done, function (e) { done(); throw e; });
@@ -1260,8 +1295,16 @@
   }
 
   // ---- idle tracking -----------------------------------------------------
+  var warningOpen = false;
   ['mousedown', 'keydown', 'touchstart', 'scroll', 'click'].forEach(function (evt) {
-    window.addEventListener(evt, function () { lastActivity = Date.now(); }, { passive: true });
+    window.addEventListener(evt, function () {
+      // Once the warning is up, ordinary activity no longer counts. Otherwise
+      // a stray click behind the dialog silently resets the idle timer, the
+      // countdown never reaches zero, and the modal sits there forever
+      // without the session being extended either — the user must answer it.
+      if (warningOpen) return;
+      lastActivity = Date.now();
+    }, { passive: true });
   });
   // Coming back to the tab is not treated as activity on purpose: the point
   // is to notice a session that died while the tab sat in the background.
@@ -1285,7 +1328,7 @@
   function sessionTick() {
     if (!session) { hideTimeoutModal(); renderSessionCard(); return; }
     var remaining = Math.min(idleRemaining(), absoluteRemaining());
-    if (remaining <= 0) { endSession('Signed out after inactivity 🔒', true); return; }
+    if (remaining <= 0) { endSession(null, true, true); return; }
     if (remaining <= WARN_BEFORE_MS) showTimeoutModal(remaining); else hideTimeoutModal();
     // Background renewal only while the person is genuinely around —
     // otherwise the timer alone would keep the server-side session alive
@@ -1299,36 +1342,49 @@
   }
   setInterval(sessionTick, 1000);
 
-  function renderSessionCard(remaining) {
-    var line = document.getElementById('session-line');
-    var pill = document.getElementById('session-pill');
-    var meter = document.getElementById('session-meter');
-    if (!line || !pill || !meter) return;
-    var bar = meter.querySelector('i');
-    if (!session) {
-      line.textContent = 'Signed out';
-      pill.textContent = 'ended'; pill.className = 'state-pill muted';
-      if (bar) bar.style.width = '0%';
-      return;
-    }
-    var rem = remaining === undefined ? Math.min(idleRemaining(), absoluteRemaining()) : remaining;
-    var total = session.idleTimeoutMs || DEFAULT_IDLE_MS;
-    var pct = Math.max(0, Math.min(100, (rem / total) * 100));
-    line.textContent = 'Signs out in ' + formatDuration(rem);
-    pill.textContent = rem <= WARN_BEFORE_MS ? 'expiring' : 'active';
-    pill.className = 'state-pill ' + (rem <= WARN_BEFORE_MS ? 'warn' : 'ok');
-    meter.className = 'session-meter' + (pct < 20 ? ' low' : '');
-    if (bar) bar.style.width = pct.toFixed(1) + '%';
-  }
+  /* The account panel deliberately shows only a plain Sign out button — no
+     status card or countdown meter. The session machinery below is unchanged
+     and still runs; it just has no dedicated UI. The only thing the user ever
+     sees is the "Still there?" warning shortly before an idle sign-out. */
+  function renderSessionCard() {}
 
   function showTimeoutModal(remaining) {
     var el = document.getElementById('timeout-modal');
-    document.getElementById('timeout-count').textContent = Math.max(0, Math.ceil(remaining / 1000)) + 's';
-    if (!el.classList.contains('show')) { el.classList.add('show'); overlay.classList.add('show'); }
+    var secs = Math.max(0, Math.ceil(remaining / 1000));
+    document.getElementById('timeout-count').textContent = secs;
+    // The bar drains across the whole warning window, so the remaining time
+    // is readable at a glance without parsing the number.
+    var bar = document.getElementById('timeout-bar');
+    var pct = Math.max(0, Math.min(100, (remaining / WARN_BEFORE_MS) * 100));
+    bar.classList.toggle('low', pct < 34);
+    bar.querySelector('i').style.width = pct.toFixed(1) + '%';
+    if (!el.classList.contains('show')) {
+      el.classList.add('show'); overlay.classList.add('show');
+      warningOpen = true;
+      var stay = document.getElementById('timeout-stay');
+      if (stay && stay.focus) stay.focus();
+    }
   }
   function hideTimeoutModal() {
+    warningOpen = false;
     var el = document.getElementById('timeout-modal');
     if (!el || !el.classList.contains('show')) return;
+    el.classList.remove('show');
+    if (!document.querySelector('.drawer.open, .modal.show')) overlay.classList.remove('show');
+  }
+  // Stage 2. Only ever raised by an automatic timeout — a deliberate sign-out
+  // gets a toast, because the person already knows what they did.
+  function showLoggedOutModal() {
+    closePanels();
+    var el = document.getElementById('loggedout-modal');
+    el.classList.add('show');
+    overlay.classList.add('show');
+    var btn = document.getElementById('loggedout-close');
+    if (btn && btn.focus) btn.focus();
+  }
+  function hideLoggedOutModal() {
+    var el = document.getElementById('loggedout-modal');
+    if (!el) return;
     el.classList.remove('show');
     if (!document.querySelector('.drawer.open, .modal.show')) overlay.classList.remove('show');
   }
@@ -1337,7 +1393,15 @@
     hideTimeoutModal();
     refreshSession().then(function () { toast('Session extended ✅'); }).catch(function () {});
   });
-  document.getElementById('timeout-out').addEventListener('click', function () { endSession('Signed out', true); });
+  document.getElementById('timeout-out').addEventListener('click', function () {
+    // An explicit logout is not a timeout, so no stage-2 dialog.
+    endSession('Signed out', true);
+  });
+  document.getElementById('loggedout-close').addEventListener('click', function () {
+    hideLoggedOutModal();
+    setAuthMode('login');
+    openPanel('auth-modal');
+  });
 
   // ---- cross-tab sync ----------------------------------------------------
   // Verifying (or signing out) in one tab updates every other open tab,
@@ -1639,13 +1703,6 @@
   // Sign-out revokes the refresh token server-side (and is audited there).
   document.getElementById('logout-btn').addEventListener('click', function () {
     endSession('Signed out', apiUp);
-  });
-
-  document.getElementById('logout-all-btn').addEventListener('click', function () {
-    if (!apiUp || !session) { endSession('Signed out'); return; }
-    sendAuthJSON('POST', '/auth/logout-all', {})
-      .catch(function () {})
-      .then(function () { endSession('Signed out on all devices 🔒'); });
   });
 
   /* Rehydrate on load: ask the server how much of this session is left and
