@@ -26,6 +26,10 @@ spec:
         - name: notification-service
           image: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/notification-service:2e71aee
           imagePullPolicy: Always
+          envFrom:
+            - secretRef:
+                name: bakery-public-urls
+                optional: true
           ports:
             - containerPort: 3010
           securityContext:
@@ -40,6 +44,10 @@ spec:
               value: "3010"
             - name: LOG_LEVEL
               value: "info"
+            # APP_BASE_URL is supplied by the bakery-public-urls Secret
+            # (envFrom below) — it is the origin every CTA in a mail is built
+            # from: Order now, See the menu, Redeem now, Track this order and
+            # the unsubscribe link. Not committed; see docs/PUBLIC_URLS.md.
             # Producer side of the queue — notification-worker drains it.
             - name: DATABASE_URL
               valueFrom:
