@@ -94,6 +94,8 @@ services:
       DOCS_SERVER_ENABLED: ${DOCS_SERVER_ENABLED:-true}
       # Set to true only if you deliberately want the old inline /api/docs.
       API_DOCS_ON_GATEWAY: ${API_DOCS_ON_GATEWAY:-false}
+      PUBLIC_API_BASE_URL: ${PUBLIC_API_BASE_URL:-}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
 
   # --------------------------------------------------------- domain services
   auth-service:
@@ -236,6 +238,9 @@ services:
     environment:
       <<: *node-env
       SERVICE_NAME: notification-service
+      # Address security emails ask customers to report to.
+      MAIL_SUPPORT: ${MAIL_SUPPORT:-}
+      APP_BASE_URL: ${APP_BASE_URL:-http://localhost:8080}
       PORT: "3010"
       DATABASE_URL: postgresql://${POSTGRES_USER:-bakery}:${POSTGRES_PASSWORD:-bakery}@postgres:5432/${POSTGRES_DB:-bakery}
     depends_on:
@@ -251,6 +256,9 @@ services:
     environment:
       <<: *node-env
       SERVICE_NAME: notification-worker
+      # Address security emails ask customers to report to.
+      MAIL_SUPPORT: ${MAIL_SUPPORT:-}
+      APP_BASE_URL: ${APP_BASE_URL:-http://localhost:8080}
       PORT: "3110"
       WORKER_PROBE_PORT: "3110"
       DATABASE_URL: postgresql://${POSTGRES_USER:-bakery}:${POSTGRES_PASSWORD:-bakery}@postgres:5432/${POSTGRES_DB:-bakery}

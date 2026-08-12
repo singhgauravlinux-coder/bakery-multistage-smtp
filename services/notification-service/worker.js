@@ -59,6 +59,11 @@ async function processJob(job) {
   try {
     await deliver(job);
     await queue.markSent(job.id);
+    // Audit trail: the queue row is now 'sent' and will never mention the
+    // attempts it took, so the outcome is appended here instead.
+    await queue.record('sent', job, {
+      attempt: job.attempts, workerId: WORKER_ID, detail: `delivered in ${Date.now() - startedAt}ms`
+    });
     state.processed += 1;
     log.info({
       event: 'notification_sent', to: job.recipient, attempts: job.attempts,
@@ -77,6 +82,10 @@ async function processJob(job) {
     if (err.infrastructure) {
       await queue.requeue(job.id, delay, err.message).catch((dbErr) =>
         log.error({ event: 'job_bookkeeping_failed', message: dbErr.message }, 'could not requeue job'));
+      await queue.record('requeued', job, {
+        attempt: job.attempts, workerId: WORKER_ID,
+        detail: `infrastructure: ${err.message} (retry in ${delay}s)`
+      });
       state.deferred += 1;
       log.error({
         event: 'notification_deferred', to: job.recipient, attempts: job.attempts,
@@ -93,6 +102,10 @@ async function processJob(job) {
       return null;
     });
     const dead = result && result.status === 'dead';
+    await queue.record(dead ? 'dead' : 'failed', job, {
+      attempt: job.attempts, workerId: WORKER_ID,
+      detail: `${err.permanent ? 'permanent: ' : ''}${err.message}${dead ? '' : ` (retry in ${delay}s)`}`
+    });
     if (dead) state.dead += 1; else state.failed += 1;
     log[dead ? 'error' : 'warn']({
       event: dead ? 'notification_dead_lettered' : 'notification_retry_scheduled',
