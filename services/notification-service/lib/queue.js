@@ -21,14 +21,62 @@ const MIGRATION = `
     trace_id     TEXT,
     template     TEXT,
     payload      JSONB,
+    -- Originating client, forwarded by the calling service (x-client-ip and
+    -- friends). Stored on the job because the worker sends the mail minutes
+    -- later, with no HTTP request of its own to read them from.
+    client_ip         TEXT,
+    client_user_agent TEXT,
+    origin_user_id    TEXT,
+    request_id        TEXT,
     run_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     locked_by    TEXT,
     locked_at    TIMESTAMPTZ,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
   );
+  ALTER TABLE notification_jobs ADD COLUMN IF NOT EXISTS client_ip         TEXT;
+  ALTER TABLE notification_jobs ADD COLUMN IF NOT EXISTS client_user_agent TEXT;
+  ALTER TABLE notification_jobs ADD COLUMN IF NOT EXISTS origin_user_id    TEXT;
+  ALTER TABLE notification_jobs ADD COLUMN IF NOT EXISTS request_id        TEXT;
+
   CREATE INDEX IF NOT EXISTS idx_notification_jobs_claim ON notification_jobs (status, run_at);
   CREATE INDEX IF NOT EXISTS idx_notification_jobs_trace ON notification_jobs (trace_id);
+
+  -- Append-only delivery trail. notification_jobs is mutated in place, so a
+  -- retried-then-sent message leaves no trace of having failed — fine for the
+  -- queue, useless for audit. This table records every state transition, so
+  -- "what happened to the reset mail we sent that customer" is answerable
+  -- after the fact. Never updated, only inserted; see
+  -- db/migrations/0010_notification_events.sql.
+  CREATE TABLE IF NOT EXISTS notification_events (
+    id         BIGSERIAL PRIMARY KEY,
+    job_id     TEXT NOT NULL,
+    event      TEXT NOT NULL,     -- queued | claimed | sent | failed | requeued | dead
+    channel    TEXT,
+    recipient  TEXT,
+    template   TEXT,
+    subject    TEXT,
+    attempt    INTEGER,
+    provider   TEXT,
+    detail     TEXT,              -- SMTP response or error message, truncated
+    trace_id   TEXT,
+    worker_id  TEXT,
+    client_ip         TEXT,   -- the customer's IP, not the calling pod's
+    client_user_agent TEXT,
+    origin_user_id    TEXT,
+    request_id        TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+  CREATE INDEX IF NOT EXISTS idx_notification_events_job    ON notification_events (job_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_notification_events_recip  ON notification_events (recipient, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_notification_events_trace  ON notification_events (trace_id);
+  CREATE INDEX IF NOT EXISTS idx_notification_events_event  ON notification_events (event, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_notification_events_ip     ON notification_events (client_ip, created_at DESC);
+
+  ALTER TABLE notification_events ADD COLUMN IF NOT EXISTS client_ip         TEXT;
+  ALTER TABLE notification_events ADD COLUMN IF NOT EXISTS client_user_agent TEXT;
+  ALTER TABLE notification_events ADD COLUMN IF NOT EXISTS origin_user_id    TEXT;
+  ALTER TABLE notification_events ADD COLUMN IF NOT EXISTS request_id        TEXT;
 `;
 
 // `id` is ambiguous inside UPDATE ... FROM claimed, so the claim query needs
@@ -37,6 +85,8 @@ const cols = (p = '') => `${p}id, ${p}channel, ${p}recipient, ${p}subject, ${p}b
   ${p}template, ${p}payload,
   ${p}attempts, ${p}max_attempts AS "maxAttempts", ${p}last_error AS "lastError",
   ${p}trace_id AS "traceId", ${p}run_at AS "runAt",
+  ${p}client_ip AS "clientIp", ${p}client_user_agent AS "clientUserAgent",
+  ${p}origin_user_id AS "originUserId", ${p}request_id AS "requestId",
   ${p}created_at AS "createdAt", ${p}updated_at AS "updatedAt"`;
 const ROW = cols();
 const ROW_J = cols('j.');
@@ -51,12 +101,16 @@ function createQueue({ pool, logger }) {
 
     async init() { await pool.query(MIGRATION); },
 
-    async enqueue({ channel, recipient, subject, body, traceId, maxAttempts, template, payload }) {
+    async enqueue({ channel, recipient, subject, body, traceId, maxAttempts, template, payload,
+                    clientIp, clientUserAgent, originUserId, requestId }) {
       const { rows } = await pool.query(
-        `INSERT INTO notification_jobs (id, channel, recipient, subject, body, trace_id, max_attempts, template, payload)
-         VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7, 5),$8,$9) RETURNING ${ROW}`,
+        `INSERT INTO notification_jobs
+           (id, channel, recipient, subject, body, trace_id, max_attempts, template, payload,
+            client_ip, client_user_agent, origin_user_id, request_id)
+         VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7, 5),$8,$9,$10,$11,$12,$13) RETURNING ${ROW}`,
         [newJobId(), channel, recipient, subject || null, body || '', traceId || null, maxAttempts || null,
-         template || null, payload ? JSON.stringify(payload) : null]);
+         template || null, payload ? JSON.stringify(payload) : null,
+         clientIp || null, clientUserAgent || null, originUserId || null, requestId || null]);
       return rows[0];
     },
 
@@ -150,6 +204,67 @@ function createQueue({ pool, logger }) {
       return rows.reduce((acc, r) => ({ ...acc, [r.status]: r.count }), {});
     },
 
+    // Append-only. Deliberately swallows its own errors: an audit insert
+    // must never fail a delivery or wedge the queue. A dropped event is
+    // logged loudly instead.
+    async record(event, job = {}, extra = {}) {
+      try {
+        await pool.query(
+          `INSERT INTO notification_events
+             (job_id, event, channel, recipient, template, subject, attempt, provider, detail,
+              trace_id, worker_id, client_ip, client_user_agent, origin_user_id, request_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+          [job.id || extra.jobId || null, event, job.channel || null, job.recipient || null,
+           job.template || null, job.subject || null,
+           extra.attempt != null ? extra.attempt : (job.attempts != null ? job.attempts : null),
+           extra.provider || null,
+           extra.detail == null ? null : String(extra.detail).slice(0, 500),
+           job.traceId || extra.traceId || null, extra.workerId || null,
+           job.clientIp || extra.clientIp || null,
+           job.clientUserAgent || extra.clientUserAgent || null,
+           job.originUserId || extra.originUserId || null,
+           job.requestId || extra.requestId || null]);
+      } catch (err) {
+        logger.error({ event: 'notification_event_insert_failed', jobId: job.id, kind: event, message: err.message },
+          'delivery audit row could not be written');
+      }
+    },
+
+    // Full trail for one job, oldest first — the "what happened to this
+    // message" query.
+    async history(jobId) {
+      const { rows } = await pool.query(
+        `SELECT id, job_id AS "jobId", event, channel, recipient, template, subject,
+                attempt, provider, detail, trace_id AS "traceId", worker_id AS "workerId",
+                client_ip AS "clientIp", client_user_agent AS "clientUserAgent",
+                origin_user_id AS "originUserId", request_id AS "requestId", created_at AS "createdAt"
+           FROM notification_events WHERE job_id = $1 ORDER BY created_at, id`, [jobId]);
+      return rows;
+    },
+
+    // Recent activity for one recipient — the audit question that comes up
+    // when a customer says they never got the mail.
+    async historyForRecipient(recipient, limit = 50) {
+      const { rows } = await pool.query(
+        `SELECT id, job_id AS "jobId", event, channel, recipient, template, subject,
+                attempt, provider, detail, trace_id AS "traceId",
+                client_ip AS "clientIp", origin_user_id AS "originUserId", created_at AS "createdAt"
+           FROM notification_events WHERE recipient = $1
+          ORDER BY created_at DESC, id DESC LIMIT $2`, [recipient, Math.min(Number(limit) || 50, 200)]);
+      return rows;
+    },
+
+    // Everything one IP triggered — enumeration and abuse investigation.
+    async historyForIp(clientIp, limit = 50) {
+      const { rows } = await pool.query(
+        `SELECT id, job_id AS "jobId", event, channel, recipient, template, subject,
+                attempt, detail, trace_id AS "traceId", client_ip AS "clientIp",
+                origin_user_id AS "originUserId", created_at AS "createdAt"
+           FROM notification_events WHERE client_ip = $1
+          ORDER BY created_at DESC, id DESC LIMIT $2`, [clientIp, Math.min(Number(limit) || 50, 200)]);
+      return rows;
+    },
+
     async ping() { await pool.query('SELECT 1'); }
   };
 }
@@ -159,6 +274,7 @@ function createQueue({ pool, logger }) {
 // but a separate worker container has no shared state, hence the loud warning.
 function memoryQueue({ logger }) {
   const jobs = new Map();
+  const events = [];
   if (logger) {
     logger.warn({ event: 'queue_memory_mode' },
       'DATABASE_URL unset — using in-memory queue; separate worker replicas will NOT see these jobs');
@@ -168,11 +284,14 @@ function memoryQueue({ logger }) {
   return {
     mode: 'memory',
     async init() {},
-    async enqueue({ channel, recipient, subject, body, traceId, maxAttempts, template, payload }) {
+    async enqueue({ channel, recipient, subject, body, traceId, maxAttempts, template, payload,
+                    clientIp, clientUserAgent, originUserId, requestId }) {
       const job = {
         id: newJobId(), channel, recipient, subject: subject || null, body: body || '',
         status: 'queued', attempts: 0, maxAttempts: maxAttempts || 5, lastError: null,
         traceId: traceId || null, template: template || null, payload: payload || null,
+        clientIp: clientIp || null, clientUserAgent: clientUserAgent || null,
+        originUserId: originUserId || null, requestId: requestId || null,
         runAt: now(), createdAt: now(), updatedAt: now()
       };
       jobs.set(job.id, job);
@@ -219,6 +338,33 @@ function memoryQueue({ logger }) {
       if (job) Object.assign(job, { status: 'dead', lastError: String(message).slice(0, 500), updatedAt: now() });
     },
     async reclaimStale() { return 0; },
+
+    // Memory-mode parity for the delivery trail. Bounded so a long-running
+    // dev container cannot grow it without limit.
+    async record(event, job = {}, extra = {}) {
+      events.push({
+        id: events.length + 1, jobId: job.id || extra.jobId || null, event,
+        channel: job.channel || null, recipient: job.recipient || null,
+        template: job.template || null, subject: job.subject || null,
+        attempt: extra.attempt != null ? extra.attempt : (job.attempts != null ? job.attempts : null),
+        provider: extra.provider || null,
+        detail: extra.detail == null ? null : String(extra.detail).slice(0, 500),
+        traceId: job.traceId || extra.traceId || null, workerId: extra.workerId || null,
+        clientIp: job.clientIp || extra.clientIp || null,
+        clientUserAgent: job.clientUserAgent || extra.clientUserAgent || null,
+        originUserId: job.originUserId || extra.originUserId || null,
+        requestId: job.requestId || extra.requestId || null,
+        createdAt: new Date().toISOString()
+      });
+      if (events.length > 5000) events.shift();
+    },
+    async history(jobId) { return events.filter((e) => e.jobId === jobId); },
+    async historyForRecipient(recipient, limit = 50) {
+      return events.filter((e) => e.recipient === recipient).slice(-Math.min(Number(limit) || 50, 200)).reverse();
+    },
+    async historyForIp(clientIp, limit = 50) {
+      return events.filter((e) => e.clientIp === clientIp).slice(-Math.min(Number(limit) || 50, 200)).reverse();
+    },
     async stats() {
       return [...jobs.values()].reduce((acc, j) => ({ ...acc, [j.status]: (acc[j.status] || 0) + 1 }), {});
     },
