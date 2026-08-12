@@ -81,6 +81,7 @@ commonLabels:
 
 
 
+
 patches:
 - path: patch-ingress-host.yaml
   target:
@@ -181,7 +182,7 @@ images:
   newTag: d30780b
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/notification-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/notification-service
-  newTag: a7a0c93
+  newTag: c43fac6
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/order-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/order-service
   newTag: d30780b
