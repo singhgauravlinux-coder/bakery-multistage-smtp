@@ -41,6 +41,13 @@ spec:
           image: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/notification-service:2e71aee
           imagePullPolicy: Always
           command: ["node", "worker.js"]
+          # Same public origin (and MAIL_SUPPORT) as notification-service:
+          # the worker renders the template at send time, so both the CTA
+          # links and the security "report it to" line are built here.
+          envFrom:
+            - secretRef:
+                name: bakery-public-urls
+                optional: true
           ports:
             - name: probe
               containerPort: 3110
