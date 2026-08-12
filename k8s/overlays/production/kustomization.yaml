@@ -83,7 +83,7 @@ images:
   newTag: d30780b
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/frontend
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/frontend
-  newTag: 91284ec
+  newTag: ded6bb9
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/inventory-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/inventory-service
   newTag: d30780b
