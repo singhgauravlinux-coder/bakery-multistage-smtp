@@ -95,6 +95,18 @@ const SAMPLES = {
     address: '14 Brigade Road, Bengaluru 560001',
     orderUrl: 'https://crumb-and-ember.example/orders/CE-1042'
   },
+  'password-reset': {
+    customerName: 'Gaurav', email: 'gaurav@example.com',
+    // A realistic-shaped JWT so the raw-URL fallback wraps the way it will
+    // in a real send — a short fake token hides the line-break problem.
+    token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJjcnViLWFuZC1lbWJlciIsInB1cnBvc2UiOiJyZXNldCJ9.6KgjWC9cNCner-kljZUYLfUsUdCbEK1lgjB',
+    expiresMinutes: 15
+  },
+  'email-verification': {
+    customerName: 'Gaurav', email: 'gaurav@example.com',
+    token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJjcnViLWFuZC1lbWJlciIsInB1cnBvc2UiOiJ2ZXJpZnkifQ.mp0aSI6Ijk2ZWU5MGY5LWVkZWEtNDJm',
+    expiresMinutes: 15
+  },
   // Promotional samples. Every one carries an unsubscribeUrl because the
   // marketing footer renders it unconditionally — a preview without it would
   // hide the one link that is legally required to be there.
@@ -153,6 +165,30 @@ app.get('/ready', async (req, res) => {
 // 202 immediately. notification-worker replicas claim and dispatch it, which
 // is what makes the 202 honest: a job survives a crash here, and a slow
 // provider can no longer stall the caller's request thread.
+// The originating client, as forwarded by the calling service. This is NOT
+// req.ip: notification-service is called service-to-service, so its socket
+// peer is the auth-service pod, and recording that would make the delivery
+// audit useless. The caller passes the real client identity in x-client-*
+// headers; we fall back to the socket only so a direct call still records
+// something rather than a null.
+//
+// These headers are trusted because this service is cluster-internal and not
+// routed by the public Ingress. If it is ever exposed, they must be stripped
+// at the edge — a spoofable x-client-ip in an audit trail is worse than none.
+function originInfo(req) {
+  const hdr = (n) => {
+    const v = req.headers[n];
+    return v ? String(Array.isArray(v) ? v[0] : v).slice(0, 512) : null;
+  };
+  const socketIp = (req.ip || (req.socket && req.socket.remoteAddress) || '').replace(/^::ffff:/, '') || null;
+  return {
+    clientIp: hdr('x-client-ip') || socketIp,
+    clientUserAgent: hdr('x-client-user-agent') || hdr('user-agent'),
+    originUserId: hdr('x-origin-user-id'),
+    requestId: hdr('x-request-id') || req.traceId || null
+  };
+}
+
 async function enqueueHandler(channel, req, res, next) {
   try {
     const { to, subject, body, maxAttempts, template, data } = req.body || {};
@@ -164,6 +200,7 @@ async function enqueueHandler(channel, req, res, next) {
       return res.status(400).json({ error: `unknown template: ${template}`, available: templateNames });
     }
 
+    const origin = originInfo(req);
     const job = await queue.enqueue({
       channel,
       recipient: String(to),
@@ -172,13 +209,19 @@ async function enqueueHandler(channel, req, res, next) {
       traceId: req.traceId,
       maxAttempts: Number.isInteger(maxAttempts) ? maxAttempts : undefined,
       template: template || undefined,
-      payload: data || undefined
+      payload: data || undefined,
+      ...origin
     });
 
     req.log.info({
       event: 'notification_enqueued', jobId: job.id, channel, to, template: template || undefined,
+      clientIp: origin.clientIp, originUserId: origin.originUserId,
       subject: channel === 'email' ? (subject || '(no subject)') : undefined
     }, 'notification queued for delivery');
+
+    // First entry in the delivery trail. Written after the job row so a
+    // failure here can never lose the message itself.
+    await queue.record('queued', job, { attempt: 0, detail: 'accepted by API' });
 
     res.status(202).json({
       status: 'queued', channel, to, jobId: job.id, traceId: req.traceId
@@ -201,6 +244,39 @@ app.get('/notify/templates/:name/preview', (req, res, next) => {
     const out = render(req.params.name, sample);
     if (req.query.format === 'text') return res.type('text/plain').send(out.text);
     res.type('html').send(out.html);
+  } catch (err) { next(err); }
+});
+
+// --- delivery audit --------------------------------------------------------
+// notification_jobs holds only the CURRENT state, so a message that failed
+// twice and then succeeded looks identical to one that sent first time.
+// These read the append-only notification_events trail instead.
+app.get('/notify/jobs/:id/events', async (req, res, next) => {
+  try {
+    const events = await queue.history(req.params.id);
+    if (!events.length) {
+      const job = await queue.get(req.params.id);
+      if (!job) return res.status(404).json({ error: 'Notification job not found' });
+    }
+    res.json({ jobId: req.params.id, count: events.length, events });
+  } catch (err) { next(err); }
+});
+
+// "Did we ever email this customer, and what happened?" — the question that
+// actually gets asked during an audit or a support escalation.
+app.get('/notify/audit', async (req, res, next) => {
+  try {
+    const { recipient, ip } = req.query;
+    if (!recipient && !ip) {
+      return res.status(400).json({ error: 'recipient or ip query parameter is required' });
+    }
+    // Querying by IP answers the abuse question: one address triggering
+    // reset mails to many different accounts is enumeration, and that only
+    // shows up if the originating IP is on the row.
+    const events = recipient
+      ? await queue.historyForRecipient(recipient, req.query.limit)
+      : await queue.historyForIp(ip, req.query.limit);
+    res.json({ recipient: recipient || undefined, ip: ip || undefined, count: events.length, events });
   } catch (err) { next(err); }
 });
 
