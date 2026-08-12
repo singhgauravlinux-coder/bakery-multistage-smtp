@@ -41,6 +41,10 @@ const APP_BASE_URL = (process.env.APP_BASE_URL || '').replace(/\/+$/, '');
 // How often the browser should re-check verification status. Sent to the
 // client so the polling cadence is server-controlled, not hard-coded in HTML.
 const VERIFY_POLL_INTERVAL_MS = Number(process.env.AUTH_VERIFY_POLL_INTERVAL_MS || 5000);
+// Link builders. Both mirror what the notification-service templates would
+// construct, so the plain-text fallback body carries a working URL even when
+// notification-service is unreachable and the mail never gets templated.
+const resetLink = (token) => `${APP_BASE_URL}/reset-password?token=${encodeURIComponent(token)}`;
 // The demo stack has no real mail transport (notification-service is a mock
 // dispatcher), so security tokens/OTPs are additionally returned in API
 // responses to keep the UI flows usable. MUST be "false" in production.
@@ -507,22 +511,78 @@ const audit = createAuditLogger({ pool, logger, service: SERVICE_NAME });
 // `template` + `data` select an HTML template in notification-service
 // (lib/templates.js); `body` stays as the plain-text fallback for callers that
 // have no template yet. Sending neither is what produced unstyled mail.
-async function sendEmail(to, subject, body, log, traceId, { template, data } = {}) {
+// Every security email is audited, not just logged. A log line is enough for
+// debugging, but "was a reset link actually sent to this address, and did the
+// notification service accept it?" is an audit question that has to survive
+// log rotation — so it goes in security_audit_logs alongside the login and
+// session events, keyed by the same request_id.
+//
+// `ctx` carries the clientInfo() fields plus userId/email so the row can be
+// correlated with the action that triggered the send. Delivery here means
+// "accepted and queued by notification-service", NOT "landed in the inbox";
+// the queued job id is recorded so the final SMTP outcome can be looked up in
+// notification_jobs / notification_events.
+async function sendEmail(to, subject, body, log, traceId, { template, data, audit: ctx, action } = {}) {
+  const started = Date.now();
+  let jobId = null;
   try {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 3000);
     const res = await fetch(`${NOTIFY_URL}/notify/email`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', ...(traceId ? { 'x-trace-id': traceId } : {}) },
+      headers: {
+        'content-type': 'application/json',
+        ...(traceId ? { 'x-trace-id': traceId } : {}),
+        // Propagate the ORIGINATING client's identity. Without these,
+        // notification-service only ever sees the auth-service pod IP, so
+        // its delivery audit would record a cluster address instead of the
+        // person who asked for the reset. Named x-client-* rather than
+        // x-forwarded-for because this is not a proxy hop — the mail is a
+        // side effect of the original request, not a forward of it.
+        ...(ctx && ctx.ip ? { 'x-client-ip': ctx.ip } : {}),
+        ...(ctx && ctx.userAgent ? { 'x-client-user-agent': String(ctx.userAgent).slice(0, 512) } : {}),
+        ...(ctx && ctx.userId ? { 'x-origin-user-id': ctx.userId } : {}),
+        ...(ctx && ctx.requestId ? { 'x-request-id': ctx.requestId } : {})
+      },
       body: JSON.stringify({ to, subject, body, ...(template ? { template, data: data || {} } : {}) }),
       signal: ctrl.signal
     });
     clearTimeout(timer);
-    log.info({ event: 'security_email_dispatched', to, subject, template, delivered: res.ok }, 'security email dispatched');
+    const payload = await res.json().catch(() => ({}));
+    jobId = payload.jobId || null;
+    log.info({ event: 'security_email_dispatched', to, subject, template, jobId, delivered: res.ok }, 'security email dispatched');
+    if (ctx) {
+      audit.record({
+        ...ctx,
+        action: action || 'security_email',
+        success: res.ok,
+        statusCode: res.status,
+        failureReason: res.ok ? undefined : `notify_${res.status}`,
+        metadata: {
+          template: template || null, subject, recipient: to,
+          jobId, traceId: traceId || null, queued: res.ok,
+          durationMs: Date.now() - started
+        }
+      });
+    }
     return res.ok;
   } catch (err) {
     log.warn({ event: 'security_email_failed', to, subject, message: err.message },
       'notification-service unreachable — email content was logged only');
+    if (ctx) {
+      audit.record({
+        ...ctx,
+        action: action || 'security_email',
+        success: false,
+        statusCode: 503,
+        failureReason: err.name === 'AbortError' ? 'notify_timeout' : 'notify_unreachable',
+        metadata: {
+          template: template || null, subject, recipient: to,
+          jobId: null, traceId: traceId || null, queued: false,
+          error: err.message, durationMs: Date.now() - started
+        }
+      });
+    }
     return false;
   }
 }
@@ -696,7 +756,8 @@ async function handleFailedLogin(req, res, info, email, account, reason) {
       await store.lock(email, sha256(unlockToken), expiresAt);
       const unlockLink = `/api/auth/unlock?token=${unlockToken}`;
       await sendEmail(email, 'Your Crumb & Ember account is locked',
-        `Too many failed sign-in attempts. Unlock your account within 30 minutes: ${unlockLink}`, req.log, req.traceId);
+        `Too many failed sign-in attempts. Unlock your account within 30 minutes: ${unlockLink}`, req.log, req.traceId,
+        { audit: { ...info, userId: account.userId, email }, action: 'security_email_account_locked' });
       req.log.warn({
         event: 'account_locked', email, userId: account.userId, ip: info.ip,
         requestId: info.requestId, browser: info.browser, os: info.os, device: info.device,
@@ -1011,8 +1072,22 @@ app.post('/auth/forgot-password', async (req, res, next) => {
     }
 
     const resetToken = signScopedToken(account.userId, 'reset', RESET_TOKEN_TTL_MS);
+    // The reset link is built by the notification-service template from its
+    // APP_BASE_URL plus this token. Previously this mail carried the sentence
+    // but no link at all, which made the whole flow unusable from the inbox.
     await sendEmail(email, 'Reset your Crumb & Ember password',
-      'Use this link within 15 minutes to reset your password.', req.log, req.traceId);
+      `Use this link within ${Math.round(RESET_TOKEN_TTL_MS / 60000)} minutes to reset your password: ${resetLink(resetToken)}`,
+      req.log, req.traceId, {
+        template: 'password-reset',
+        audit: { ...info, userId: account.userId, email }, action: 'security_email_password_reset',
+        data: {
+          customerName: account.name,
+          email: account.email,
+          token: resetToken,
+          resetUrl: resetLink(resetToken),
+          expiresMinutes: Math.round(RESET_TOKEN_TTL_MS / 60000)
+        }
+      });
     req.log.info({ event: 'password_reset_requested', userId: account.userId, ip: info.ip, requestId: info.requestId }, 'reset link generated and emailed');
     audit.record({ ...info, action: 'forgot_password', userId: account.userId, email, success: true, statusCode: 200 });
     const payload = { message: 'If that email exists, a reset link was sent.' };
@@ -1066,6 +1141,7 @@ app.post('/auth/password/request', async (req, res, next) => {
     await sendEmail(account.email, 'Your Crumb & Ember verification code',
       `Your password-change code is ${otp}. It expires in 10 minutes.`, req.log, req.traceId, {
         template: 'verification-code',
+        audit: { ...info, userId, email: account.email }, action: 'security_email_otp',
         data: {
           code: otp,
           purpose: 'password change',
@@ -1154,7 +1230,17 @@ app.post('/auth/verify-email/request', async (req, res, next) => {
     const verifyLink = `${APP_BASE_URL}/?verify=${encodeURIComponent(verifyEmailToken)}`;
     await sendEmail(account.email, 'Verify your Crumb & Ember email',
       `Use this link within ${Math.round(RESET_TOKEN_TTL_MS / 60000)} minutes to verify your email address: ${verifyLink}`,
-      req.log, req.traceId);
+      req.log, req.traceId, {
+        template: 'email-verification',
+        audit: { ...info, userId, email: account.email }, action: 'security_email_verification',
+        data: {
+          customerName: account.name,
+          email: account.email,
+          token: verifyEmailToken,
+          verifyUrl: verifyLink,
+          expiresMinutes: Math.round(RESET_TOKEN_TTL_MS / 60000)
+        }
+      });
     audit.record({ ...info, action: 'email_verification_request', userId, email: account.email, success: true, statusCode: 200 });
     const payload = {
       message: 'A verification link was emailed to you.',
