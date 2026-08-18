@@ -104,7 +104,7 @@ images:
   newTag: 579532d
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/order-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/order-service
-  newTag: d30780b
+  newTag: 579532d
 - name: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/payment-service
   newName: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/payment-service
   newTag: 579532d
