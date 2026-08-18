@@ -58,16 +58,3 @@ spec:
                   number: 3100
             path: /
             pathType: Prefix
-          - backend:
-              service:
-                name: api-docs
-                port:
-                  number: 3100
-            path: /
-            pathType: Exact
-          - backend:
-              service:
-                name: api-gateway
-                port:
-                  number: 3000
-            path: /
