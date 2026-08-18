@@ -1,0 +1,276 @@
+# GENERATED FILE — do not hand-edit.
+# Source of truth: db/migrations/*.sql
+# Regenerate with: scripts/sync-db-migrations-configmap.sh
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bakery-db-migrations
+  namespace: bakery
+  labels:
+    app.kubernetes.io/part-of: crumb-and-ember
+data:
+  0001_account_security.sql: |
+    -- Failed-login tracking + account locking/unlocking + email verification.
+    -- Idempotent; also applied automatically by auth-service on startup.
+    ALTER TABLE accounts ADD COLUMN IF NOT EXISTS failed_login_attempts   INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE accounts ADD COLUMN IF NOT EXISTS last_failed_login_at    TIMESTAMPTZ;
+    ALTER TABLE accounts ADD COLUMN IF NOT EXISTS locked_at               TIMESTAMPTZ;
+    ALTER TABLE accounts ADD COLUMN IF NOT EXISTS unlock_token_hash       TEXT;
+    ALTER TABLE accounts ADD COLUMN IF NOT EXISTS unlock_token_expires_at TIMESTAMPTZ;
+    ALTER TABLE accounts ADD COLUMN IF NOT EXISTS email_verified          BOOLEAN NOT NULL DEFAULT false;
+  0002_login_history.sql: |
+    -- Per-attempt login history (success and failure) with client forensics.
+    CREATE TABLE IF NOT EXISTS login_history (
+      id             BIGSERIAL PRIMARY KEY,
+      user_id        TEXT,
+      email          TEXT,
+      success        BOOLEAN NOT NULL,
+      failure_reason TEXT,
+      ip             TEXT,
+      user_agent     TEXT,
+      browser        TEXT,
+      os             TEXT,
+      device         TEXT,
+      request_id     TEXT,
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_login_history_user  ON login_history (user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_login_history_email ON login_history (email, created_at DESC);
+  0003_security_audit_logs.sql: |
+    -- Cross-service security/audit trail: registration, login, logout,
+    -- forgot/reset/change password, email verification, payments, orders,
+    -- invoices and profile updates.
+    CREATE TABLE IF NOT EXISTS security_audit_logs (
+      id             BIGSERIAL PRIMARY KEY,
+      service        TEXT NOT NULL,
+      action         TEXT NOT NULL,
+      user_id        TEXT,
+      email          TEXT,
+      ip             TEXT,
+      user_agent     TEXT,
+      browser        TEXT,
+      os             TEXT,
+      device         TEXT,
+      endpoint       TEXT,
+      method         TEXT,
+      request_id     TEXT,
+      status_code    INTEGER,
+      success        BOOLEAN NOT NULL DEFAULT true,
+      failure_reason TEXT,
+      metadata       JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_audit_user    ON security_audit_logs (user_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_action  ON security_audit_logs (action, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_request ON security_audit_logs (request_id);
+  0004_orders_payment_gating.sql: |
+    -- Orders now carry payment state; prepaid orders start as pending_payment
+    -- and are confirmed only after the payment service verifies the charge.
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'card';
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_status TEXT NOT NULL DEFAULT 'paid';
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_id     TEXT;
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS amount         NUMERIC(10,2);
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS currency       TEXT NOT NULL DEFAULT 'EUR';
+    ALTER TABLE orders ADD COLUMN IF NOT EXISTS paid_at        TIMESTAMPTZ;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_payment_id ON orders (payment_id) WHERE payment_id IS NOT NULL;
+  0005_payment_logs.sql: |
+    -- Payment event trail (created / captured / rejected / webhook updates)
+    -- plus a masked instrument summary on the payment row (never full PAN).
+    ALTER TABLE payments ADD COLUMN IF NOT EXISTS instrument_summary TEXT;
+    CREATE TABLE IF NOT EXISTS payment_events (
+      id         BIGSERIAL PRIMARY KEY,
+      payment_id TEXT,
+      order_id   TEXT,
+      event      TEXT NOT NULL,
+      status     TEXT,
+      amount     NUMERIC(10,2),
+      currency   TEXT,
+      ip         TEXT,
+      request_id TEXT,
+      detail     JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_payment_events_payment ON payment_events (payment_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_payment_events_order   ON payment_events (order_id, created_at DESC);
+  0006_invoices.sql: |
+    -- Invoices move from in-memory to Postgres.
+    CREATE TABLE IF NOT EXISTS invoices (
+      id          TEXT PRIMARY KEY,
+      order_id    TEXT NOT NULL,
+      amount      NUMERIC(10,2) NOT NULL,
+      currency    TEXT NOT NULL DEFAULT 'EUR',
+      customer    TEXT NOT NULL DEFAULT 'walk-in',
+      issued_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+      due_in_days INTEGER NOT NULL DEFAULT 14
+    );
+    CREATE INDEX IF NOT EXISTS idx_invoices_order ON invoices (order_id);
+  0007_notification_jobs.sql: |
+    -- Notifications move from fire-and-forget to a durable Postgres queue.
+    -- notification-service INSERTs jobs; notification-worker claims them with
+    -- FOR UPDATE SKIP LOCKED so N worker replicas never process the same row.
+    CREATE TABLE IF NOT EXISTS notification_jobs (
+      id           TEXT PRIMARY KEY,
+      channel      TEXT NOT NULL,                    -- 'email' | 'sms'
+      recipient    TEXT NOT NULL,
+      subject      TEXT,
+      body         TEXT NOT NULL DEFAULT '',
+      status       TEXT NOT NULL DEFAULT 'queued',   -- queued|processing|sent|dead
+      attempts     INTEGER NOT NULL DEFAULT 0,
+      max_attempts INTEGER NOT NULL DEFAULT 5,
+      last_error   TEXT,
+      trace_id     TEXT,
+      run_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+      locked_by    TEXT,
+      locked_at    TIMESTAMPTZ,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    
+    -- The claim query filters on (status, run_at) and orders by run_at; this
+    -- index is what keeps SKIP LOCKED cheap as the dead/sent rows accumulate.
+    CREATE INDEX IF NOT EXISTS idx_notification_jobs_claim ON notification_jobs (status, run_at);
+    CREATE INDEX IF NOT EXISTS idx_notification_jobs_trace ON notification_jobs (trace_id);
+  0008_notification_templates.sql: |
+    -- Notifications can now be rendered from a named HTML template instead of a
+    -- raw body. `template` selects the renderer (see
+    -- services/notification-service/lib/templates.js) and `payload` carries the
+    -- data it needs. Rendering happens in the worker at delivery time, not at
+    -- enqueue time, so a template fix reaches jobs that are already queued.
+    ALTER TABLE notification_jobs ADD COLUMN IF NOT EXISTS template TEXT;
+    ALTER TABLE notification_jobs ADD COLUMN IF NOT EXISTS payload JSONB;
+  0009_auth_sessions.sql: |
+    -- 0009_auth_sessions.sql
+    -- Refresh-token sessions backing the short-lived access tokens.
+    --
+    -- One row per login. Each /auth/refresh rotates the row in place: a new
+    -- secret hash is written and last_used_at is bumped. Only the SHA-256 of the
+    -- refresh secret is ever stored, so a dump of this table cannot be replayed.
+    --
+    -- Two independent deadlines end a session:
+    --   * idle     -> now() - last_used_at > AUTH_SESSION_IDLE_TIMEOUT_MS
+    --   * absolute -> now() > absolute_expires_at
+    -- Both are enforced in the service on every refresh; the columns here are
+    -- what those checks read.
+    --
+    -- auth-service applies the same DDL itself at boot (idempotent), so this file
+    -- exists for teams driving schema with a migration tool instead.
+    
+    CREATE TABLE IF NOT EXISTS auth_sessions (
+      id                  TEXT PRIMARY KEY,          -- session id, also the refresh-token prefix
+      user_id             TEXT NOT NULL,
+      refresh_token_hash  TEXT NOT NULL,             -- sha256 of the current secret
+      issued_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+      last_used_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+      expires_at          TIMESTAMPTZ NOT NULL,      -- refresh-token expiry
+      absolute_expires_at TIMESTAMPTZ NOT NULL,      -- hard ceiling from login
+      rotations           INTEGER NOT NULL DEFAULT 0,
+      revoked_at          TIMESTAMPTZ,
+      revoked_reason      TEXT,                      -- logout | logout_all | session_idle_timeout
+                                                     -- | session_absolute_timeout | refresh_token_reuse
+                                                     -- | password_reset | password_changed
+      ip                  TEXT,
+      user_agent          TEXT,
+      browser             TEXT,
+      os                  TEXT,
+      device              TEXT
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_sessions_user ON auth_sessions (user_id, revoked_at);
+    CREATE INDEX IF NOT EXISTS idx_sessions_hash ON auth_sessions (refresh_token_hash);
+  0010_notification_events.sql: |
+    -- 0010_notification_events.sql
+    -- Append-only delivery trail for every notification.
+    --
+    -- Why this exists: notification_jobs is mutated in place. A message that
+    -- failed twice on a flaky SMTP host and then succeeded ends up as a single
+    -- row with status='sent' and attempts=3 — the failures themselves, their
+    -- timing, and their error text are gone. That is fine for running the queue
+    -- and useless for audit.
+    --
+    -- This table records every state transition instead, and is never updated or
+    -- deleted by the application. Typical audit queries:
+    --
+    --   -- what happened to one message
+    --   SELECT event, attempt, detail, created_at
+    --     FROM notification_events WHERE job_id = 'ntf-...' ORDER BY created_at;
+    --
+    --   -- every security email sent to one customer
+    --   SELECT created_at, template, event, detail
+    --     FROM notification_events
+    --    WHERE recipient = 'someone@example.com'
+    --    ORDER BY created_at DESC LIMIT 50;
+    --
+    --   -- delivery failure rate by template, last 24h
+    --   SELECT template,
+    --          count(*) FILTER (WHERE event = 'sent')   AS sent,
+    --          count(*) FILTER (WHERE event = 'failed') AS failed,
+    --          count(*) FILTER (WHERE event = 'dead')   AS dead
+    --     FROM notification_events
+    --    WHERE created_at > now() - interval '24 hours'
+    --    GROUP BY template ORDER BY dead DESC, failed DESC;
+    --
+    --   -- one IP triggering resets across many accounts = enumeration
+    --   SELECT client_ip, count(DISTINCT recipient) AS accounts, count(*) AS mails
+    --     FROM notification_events
+    --    WHERE template = 'password-reset' AND created_at > now() - interval '1 hour'
+    --    GROUP BY client_ip HAVING count(DISTINCT recipient) > 3
+    --    ORDER BY accounts DESC;
+    --
+    --   -- join a delivery back to the auth event that triggered it
+    --   SELECT a.action, a.email, e.event, e.detail, e.created_at
+    --     FROM security_audit_logs a
+    --     JOIN notification_events e ON e.job_id = a.metadata->>'jobId'
+    --    WHERE a.action LIKE 'security_email_%'
+    --    ORDER BY e.created_at DESC;
+    --
+    -- notification-service and the workers apply the same DDL at boot (it is
+    -- idempotent), so this file is for teams driving schema with a migration
+    -- tool instead.
+    
+    CREATE TABLE IF NOT EXISTS notification_events (
+      id         BIGSERIAL PRIMARY KEY,
+      job_id     TEXT NOT NULL,
+      event      TEXT NOT NULL,     -- queued | sent | failed | requeued | dead
+      channel    TEXT,
+      recipient  TEXT,
+      template   TEXT,
+      subject    TEXT,
+      attempt    INTEGER,
+      provider   TEXT,
+      detail     TEXT,              -- SMTP response or error message, truncated to 500 chars
+      trace_id   TEXT,
+      worker_id  TEXT,
+      -- The ORIGINATING client, forwarded by the calling service as x-client-ip
+      -- etc. Not the socket peer: notification-service is called pod-to-pod, so
+      -- its peer is the auth-service pod and recording that would be useless.
+      client_ip         TEXT,
+      client_user_agent TEXT,
+      origin_user_id    TEXT,
+      request_id        TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_notification_events_job   ON notification_events (job_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_notification_events_recip ON notification_events (recipient, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_notification_events_trace ON notification_events (trace_id);
+    CREATE INDEX IF NOT EXISTS idx_notification_events_event ON notification_events (event, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_notification_events_ip    ON notification_events (client_ip, created_at DESC);
+    
+    -- Existing deployments: CREATE TABLE IF NOT EXISTS will not add columns to a
+    -- table that already exists, so the client columns are added explicitly here
+    -- and on notification_jobs (the worker reads them from the job row, because
+    -- it sends the mail long after the HTTP request has gone).
+    ALTER TABLE notification_events ADD COLUMN IF NOT EXISTS client_ip         TEXT;
+    ALTER TABLE notification_events ADD COLUMN IF NOT EXISTS client_user_agent TEXT;
+    ALTER TABLE notification_events ADD COLUMN IF NOT EXISTS origin_user_id    TEXT;
+    ALTER TABLE notification_events ADD COLUMN IF NOT EXISTS request_id        TEXT;
+    
+    ALTER TABLE notification_jobs   ADD COLUMN IF NOT EXISTS client_ip         TEXT;
+    ALTER TABLE notification_jobs   ADD COLUMN IF NOT EXISTS client_user_agent TEXT;
+    ALTER TABLE notification_jobs   ADD COLUMN IF NOT EXISTS origin_user_id    TEXT;
+    ALTER TABLE notification_jobs   ADD COLUMN IF NOT EXISTS request_id        TEXT;
+    
+    -- Retention: this table only grows. Add a periodic prune once volume
+    -- justifies it, keeping a window long enough for your audit obligations:
+    --
+    --   DELETE FROM notification_events WHERE created_at < now() - interval '400 days';

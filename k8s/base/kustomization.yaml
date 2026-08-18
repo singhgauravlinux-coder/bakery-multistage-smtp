@@ -37,3 +37,10 @@ resources:
   - services/search-service.yaml
   - services/supplier-service.yaml
   - services/user-service.yaml
+
+  # Generated from db/migrations/*.sql — DO NOT hand-edit.
+  # Run `scripts/sync-db-migrations-configmap.sh` after adding or changing
+  # any file in db/migrations/, then commit the result. CI verifies there's
+  # no drift (same pattern the db/init.sql -> bakery-db-init ConfigMap
+  # comment already calls out — this one is just enforced, not just noted).
+  - data/db-migrations-configmap.yaml

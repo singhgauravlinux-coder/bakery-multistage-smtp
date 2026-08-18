@@ -36,6 +36,53 @@ spec:
         runAsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
+      initContainers:
+        # Applies every file in db/migrations (mounted via the
+        # bakery-db-migrations ConfigMap) in order, idempotently, before the
+        # main container starts. This is what actually fixes the
+        # "relation notification_jobs does not exist" class of failure:
+        # previously the worker self-migrated its own tables exactly once
+        # at boot with no retry, and the readiness probe only checked DB
+        # *connectivity* (SELECT 1), not schema presence — so a pod that
+        # lost the race with Postgres coming up would pass readiness and
+        # then spin forever on queries against tables that were never
+        # created. An initContainer blocks pod readiness until every
+        # migration has actually succeeded, and is retried by kubelet on
+        # failure (RestartPolicy applies to initContainers too).
+        - name: db-migrate
+          image: postgres:16-alpine
+          envFrom:
+            - secretRef:
+                name: bakery-db-secret
+          env:
+            - name: HOME
+              value: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: db-migrations
+              mountPath: /migrations
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              echo "waiting for postgres..."
+              until pg_isready -h postgres -p 5432 -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1; do
+                sleep 2
+              done
+              echo "applying db/migrations..."
+              for f in $(ls /migrations/*.sql | sort); do
+                echo "  -> $(basename "$f")"
+                psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
+              done
+              echo "migrations applied."
       containers:
         - name: notification-worker
           image: ghcr.io/singhgauravlinux-coder/bakery-multistage-smtp/notification-service:2e71aee
@@ -139,3 +186,9 @@ spec:
             limits:
               cpu: 250m
               memory: 128Mi
+      volumes:
+        - name: db-migrations
+          configMap:
+            name: bakery-db-migrations
+        - name: tmp
+          emptyDir: {}
